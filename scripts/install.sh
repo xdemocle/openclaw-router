@@ -28,23 +28,85 @@
 #
 set -euo pipefail
 
+
+# ─── Flags ──────────────────────────────────────────────────────────────────
+# --dry-run  : read-only simulation. Print what would happen but make NO
+#              changes to disk, NO sudo, NO systemd actions, NO config edits.
+#              Returns 0 if every simulated step would succeed, 1 otherwise.
+# -h, --help : print usage and exit 0.
+DRY_RUN=0
+SHOW_HELP=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) SHOW_HELP=1 ;;
+    *) echo "Unknown flag: $arg"; exit 2 ;;
+  esac
+done
+
+if [ "$SHOW_HELP" = "1" ]; then
+  cat <<'USAGE'
+openclaw-router installer
+
+Usage:
+  bash scripts/install.sh [options]
+
+Options:
+  --dry-run   Simulate every step (file copies, config edits, systemd unit
+              creation, service enable). Make NO changes to disk. Exit 0 if
+              all simulated steps would succeed.
+  -h, --help  Show this help and exit.
+
+Examples:
+  # Show what install.sh would do, without touching anything:
+  bash scripts/install.sh --dry-run
+
+  # Install for real (writes to ~/.openclaw/, /etc/systemd/, /etc/):
+  bash scripts/install.sh
+
+USAGE
+  exit 0
+fi
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo "⚡ Installing openclaw-router (DRY RUN — no changes will be made)..."
+fi
+
+# noop(): DRY_RUN gate. Prints what would happen, does nothing destructive.
+noop() {
+  echo "  [dry-run] would: $*"
+}
+
+# Default HOME if unset (e.g. when run via sudo without -E, or in a stripped env).
+: "${HOME:=/root}"
+
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ROUTER_DIR="$HOME/.openclaw/workspace/skills/router"
 SERVICE_NAME="openclaw-router"
 PORT=8402
 
-echo "⚡ Installing openclaw-router..."
-
 # ─── 1. Copy router files ──────────────────────────────────────────────────
-mkdir -p "$ROUTER_DIR"
-cp "$SKILL_DIR/server.js" "$ROUTER_DIR/server.js"
-if [ ! -f "$ROUTER_DIR/config.json" ]; then
-  cp "$SKILL_DIR/config.json" "$ROUTER_DIR/config.json"
-  echo "  ✓ Copied default config.json"
+if [ "$DRY_RUN" = "1" ]; then
+  noop "mkdir -p $ROUTER_DIR"
+  noop "cp $SKILL_DIR/server.js → $ROUTER_DIR/server.js"
+  if [ ! -f "$ROUTER_DIR/config.json" ]; then
+    noop "cp $SKILL_DIR/config.json → $ROUTER_DIR/config.json (new)"
+    echo "  ✓ Would copy default config.json"
+  else
+    echo "  ✓ config.json already exists — would preserve"
+  fi
+  echo "  ✓ Would copy server.js to $ROUTER_DIR"
 else
-  echo "  ✓ config.json already exists — preserved"
+  mkdir -p "$ROUTER_DIR"
+  cp "$SKILL_DIR/server.js" "$ROUTER_DIR/server.js"
+  if [ ! -f "$ROUTER_DIR/config.json" ]; then
+    cp "$SKILL_DIR/config.json" "$ROUTER_DIR/config.json"
+    echo "  ✓ Copied default config.json"
+  else
+    echo "  ✓ config.json already exists — preserved"
+  fi
+  echo "  ✓ Copied server.js to $ROUTER_DIR"
 fi
-echo "  ✓ Copied server.js to $ROUTER_DIR"
 
 # ─── 2. Detect OpenClaw config layout ──────────────────────────────────────
 #
@@ -188,11 +250,19 @@ fi
 # Backup the files we're about to touch — matches the .bak convention.
 ts="$(date +%Y%m%d%H%M%S)"
 if [ ! -f "${MODELS_FILE}.bak" ]; then
-  cp "$MODELS_FILE" "${MODELS_FILE}.bak"
+  if [ "$DRY_RUN" = "1" ]; then
+    noop "cp $MODELS_FILE → ${MODELS_FILE}.bak"
+  else
+    cp "$MODELS_FILE" "${MODELS_FILE}.bak"
+  fi
   echo "  ✓ Backed up $MODELS_FILE → ${MODELS_FILE}.bak"
 fi
 if [ "$AGENTS_FILE" != "$MODELS_FILE" ] && [ ! -f "${AGENTS_FILE}.bak" ]; then
-  cp "$AGENTS_FILE" "${AGENTS_FILE}.bak"
+  if [ "$DRY_RUN" = "1" ]; then
+    noop "cp $AGENTS_FILE → ${AGENTS_FILE}.bak"
+  else
+    cp "$AGENTS_FILE" "${AGENTS_FILE}.bak"
+  fi
   echo "  ✓ Backed up $AGENTS_FILE → ${AGENTS_FILE}.bak"
 fi
 
@@ -225,11 +295,12 @@ if [ "$OPENCLAW_MODE" = "include-router" ]; then
   # Edit configs/agents.json5: add "openclaw-router/auto" to defaults.models.
   # Both files are JSON5; we do surgical edits to preserve the rest.
   set +e
-  python3 - "$MODELS_FILE" "$AGENTS_FILE" "$ROUTER_PROVIDER_JSON" <<'PYEOF'
+  python3 - "$MODELS_FILE" "$AGENTS_FILE" "$ROUTER_PROVIDER_JSON" "dry_run=$DRY_RUN" <<'PYEOF'
 import json, re, sys
 from pathlib import Path
 
 models_path, agents_path, provider_json_str = sys.argv[1:4]
+DRY_RUN = len(sys.argv) > 4 and sys.argv[4] == "dry_run=1"
 PROVIDER_NAME = "openclaw-router"
 ALLOW_KEY = "openclaw-router/auto"
 
@@ -308,7 +379,10 @@ def add_provider_to_models(models_path, provider_name, provider_dict):
     leading = "," if prev_char != "," else ""
     new_block = f'{leading}\n    "{provider_name}": {body},\n  '
     new_text = text[:insert_at] + new_block + text[insert_at:]
-    Path(models_path).write_text(new_text)
+    if DRY_RUN:
+        print(f"  [dry-run] would write modified providers block to {models_path}")
+    else:
+        Path(models_path).write_text(new_text)
     return "added"
 
 def add_to_allowlist(agents_path, key):
@@ -358,7 +432,10 @@ def add_to_allowlist(agents_path, key):
     if prev_char == ",":
         new_entry = f'\n{indent}"{key}": {{}}'
     new_text = text[:insert_at] + new_entry + text[insert_at:]
-    Path(agents_path).write_text(new_text)
+    if DRY_RUN:
+        print(f"  [dry-run] would write modified allowlist block to {agents_path}")
+    else:
+        Path(agents_path).write_text(new_text)
     return "added"
 
 provider_dict = json.loads(provider_json_str)
@@ -384,10 +461,11 @@ PYEOF
   fi
 else
   # ─── Legacy (flat openclaw.json) ─────────────────────────────────────
-  python3 - "$MODELS_FILE" "$ROUTER_PROVIDER_JSON" <<'PYEOF'
+  python3 - "$MODELS_FILE" "$ROUTER_PROVIDER_JSON" "dry_run=$DRY_RUN" <<'PYEOF'
 import json, sys
 from pathlib import Path
 p, provider_json_str = sys.argv[1], sys.argv[2]
+DRY_RUN = len(sys.argv) > 3 and sys.argv[3] == "dry_run=1"
 cfg = json.loads(Path(p).read_text())
 providers = cfg.setdefault("models", {}).setdefault("providers", {})
 if "openclaw-router" not in providers:
@@ -399,7 +477,10 @@ allowlist = cfg.get("agents", {}).get("defaults", {}).get("models")
 if isinstance(allowlist, dict) and "openclaw-router/auto" not in allowlist:
     allowlist["openclaw-router/auto"] = {}
     print(f"  ✓ Added 'openclaw-router/auto' to {Path(p).name} model allowlist")
-Path(p).write_text(json.dumps(cfg, indent=2) + "\n")
+if DRY_RUN:
+    print(f"  [dry-run] would write modified {Path(p).name}")
+else:
+    Path(p).write_text(json.dumps(cfg, indent=2) + "\n")
 PYEOF
 fi
 
@@ -458,11 +539,18 @@ ROUTER_CONFIG=$ROUTER_DIR/config.json
 ROUTER_PORT=$PORT
 ROUTER_LOG=1
 STATIC
-sudo install -m 0600 "$TMP_ENV" "$ENV_FILE"
+if [ "$DRY_RUN" = "1" ]; then
+  noop "install -m 0600 env file → $ENV_FILE"
+else
+  sudo install -m 0600 "$TMP_ENV" "$ENV_FILE"
+fi
 rm -f "$TMP_ENV"
 
 UNIT_FILE="$(mktemp)"
-sudo python3 - "$UNIT_FILE" "$NODE_BIN" "$ENV_FILE" "$ROUTER_DIR" <<'PYEOF'
+if [ "$DRY_RUN" = "1" ]; then
+  noop "would render systemd unit to $UNIT_FILE"
+else
+  sudo python3 - "$UNIT_FILE" "$NODE_BIN" "$ENV_FILE" "$ROUTER_DIR" <<'PYEOF'
 import sys, os
 out, node_bin, env_file, router_dir = sys.argv[1:5]
 content = f"""[Unit]
@@ -483,20 +571,32 @@ with open(out, "w") as f:
     f.write(content)
 print(f"  ✓ Env file written with {os.path.getsize(env_file) if os.path.exists(env_file) else 0} bytes", file=sys.stderr)
 PYEOF
-sudo install -m 0644 "$UNIT_FILE" /etc/systemd/system/$SERVICE_NAME.service
+fi
+if [ "$DRY_RUN" = "1" ]; then
+  noop "install -m 0644 systemd unit → /etc/systemd/system/$SERVICE_NAME.service"
+  echo "  ✓ Would create systemd service (env file: $ENV_FILE)"
+else
+  sudo install -m 0644 "$UNIT_FILE" /etc/systemd/system/$SERVICE_NAME.service
+  echo "  ✓ Created systemd service (env file: $ENV_FILE)"
+fi
 rm -f "$UNIT_FILE"
-echo "  ✓ Created systemd service (env file: $ENV_FILE)"
 
 # ─── 7. Start the service ─────────────────────────────────────────────────
-sudo systemctl daemon-reload
-sudo systemctl enable --now "$SERVICE_NAME"
-echo "  ✓ Service started on port $PORT"
-
-sleep 1
-if curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
-  echo "  ✓ Health check passed"
+if [ "$DRY_RUN" = "1" ]; then
+  noop "systemctl daemon-reload"
+  noop "systemctl enable --now $SERVICE_NAME"
+  echo "  ✓ Would start service on port $PORT"
+  echo "  ⚠ Health check skipped in dry-run"
 else
-  echo "  ⚠ Service started but health check failed — check: journalctl -u $SERVICE_NAME -f"
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now "$SERVICE_NAME"
+  echo "  ✓ Service started on port $PORT"
+  sleep 1
+  if curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
+    echo "  ✓ Health check passed"
+  else
+    echo "  ⚠ Service started but health check failed — check: journalctl -u $SERVICE_NAME -f"
+  fi
 fi
 
 # ─── 8. Final restart hint ────────────────────────────────────────────────
