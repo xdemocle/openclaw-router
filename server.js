@@ -23,6 +23,10 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 
+// Pure scoring utilities (no Node-only deps) — extracted to router/scorer.js
+// so tests can run them without spinning up the HTTP server.
+const scorer = require("./router/scorer.js");
+
 // ─── Load Config ───
 
 const CONFIG_PATH = process.env.ROUTER_CONFIG || path.join(__dirname, "config.json");
@@ -90,174 +94,41 @@ const PORT = parseInt(process.env.ROUTER_PORT || "8402", 10);
 const LOG_ROUTING = process.env.ROUTER_LOG !== "0";
 
 // ─── Dimension Scorers ───
+// All scoring logic lives in router/scorer.js. These thin wrappers preserve
+// the existing call sites in this file and let tests exercise the scorer
+// directly without spinning up the HTTP server.
 
-function scoreTokenCount(tokens, thresholds) {
-  if (tokens < thresholds.simple) return { score: -0.8, signal: `short(${tokens}t)` };
-  if (tokens > thresholds.complex) return { score: 0.8, signal: `long(${tokens}t)` };
-  return { score: 0, signal: null };
-}
-
+function scoreTokenCount(tokens, thresholds) { return scorer.scoreTokenCount(tokens, thresholds); }
 function scoreKeywords(text, keywords, threshLow, threshHigh, scoreLow, scoreHigh) {
-  const matches = keywords.filter(kw => text.includes(kw.toLowerCase()));
-  if (matches.length >= threshHigh) return { score: scoreHigh, signal: matches.slice(0, 3).join(",") };
-  if (matches.length >= threshLow) return { score: scoreLow, signal: matches.slice(0, 2).join(",") };
-  return { score: 0, signal: null };
+  return scorer.scoreKeywords(text, keywords, threshLow, threshHigh, scoreLow, scoreHigh);
 }
-
-function scorePatterns(text, patterns) {
-  const hits = patterns.filter(p => p.test(text));
-  if (hits.length > 0) return { score: 0.5, signal: "multi-step" };
-  return { score: 0, signal: null };
-}
-
-function scoreQuestions(text) {
-  const count = (text.match(/\?/g) || []).length;
-  if (count > 3) return { score: 0.5, signal: `${count}q` };
-  return { score: 0, signal: null };
-}
+function scorePatterns(text, patterns) { return scorer.scorePatterns(text, patterns); }
+function scoreQuestions(text) { return scorer.scoreQuestions(text); }
 
 // ─── Main Classifier ───
 
 function classify(text, estimatedTokens) {
-  const s = config.scoring;
-  const lower = text.toLowerCase();
-
-  const dims = {
-    tokenCount:       scoreTokenCount(estimatedTokens, s.tokenThresholds),
-    codePresence:     scoreKeywords(lower, s.codeKeywords, 1, 3, 0.5, 1.0),
-    reasoningMarkers: scoreKeywords(lower, s.reasoningKeywords, 1, 2, 0.6, 1.0),
-    technicalTerms:   scoreKeywords(lower, s.technicalKeywords, 2, 4, 0.5, 1.0),
-    creativeMarkers:  scoreKeywords(lower, s.creativeKeywords, 1, 2, 0.4, 0.7),
-    simpleIndicators: scoreKeywords(lower, s.simpleKeywords, 1, 2, -0.8, -1.0),
-    multiStep:        scorePatterns(lower, s.multiStepPatterns),
-    questionCount:    scoreQuestions(text),
-    imperativeVerbs:  scoreKeywords(lower, s.imperativeVerbs, 1, 2, 0.3, 0.5),
-    constraints:      scoreKeywords(lower, s.constraintKeywords, 1, 3, 0.3, 0.7),
-    outputFormat:     scoreKeywords(lower, s.formatKeywords, 1, 2, 0.4, 0.7),
-    domainSpecific:   scoreKeywords(lower, s.domainKeywords, 1, 2, 0.5, 0.8),
-    agenticTask:      scoreKeywords(lower, s.agenticKeywords, 2, 4, 0.4, 0.8),
-    relayIndicators:  scoreKeywords(lower, s.relayKeywords, 1, 2, -0.9, -1.0),
-  };
-
-  let score = 0;
-  const signals = [];
-  for (const [name, dim] of Object.entries(dims)) {
-    const w = s.weights[name] || 0;
-    score += dim.score * w;
-    if (dim.signal) signals.push(`${name}:${dim.signal}`);
-  }
-
-  const overrides = s.overrides || {};
-
-  const decide = (tier, extra) => {
-    const spec = config.tiers[tier];
-    return { model: spec.model, provider: spec.provider, stripThinking: spec.stripThinking, tier, score, signals, ...extra };
-  };
-
-  const reasoningMin = overrides.reasoningKeywordMin || 2;
-  const reasoningHits = s.reasoningKeywords.filter(kw => lower.includes(kw.toLowerCase()));
-  if (reasoningHits.length >= reasoningMin) {
-    return decide("HEAVY", { confidence: 0.95, reasoning: "reasoning-override" });
-  }
-
-  const largeCtx = overrides.largeContextTokens || 50000;
-  if (estimatedTokens > largeCtx) {
-    return decide("HEAVY", { confidence: 0.95, reasoning: "large-context" });
-  }
-
-  const { lightMedium, mediumHeavy } = s.boundaries;
-  let tier, distFromBoundary;
-
-  if (score < lightMedium) {
-    tier = "LIGHT";
-    distFromBoundary = lightMedium - score;
-  } else if (score < mediumHeavy) {
-    tier = "MEDIUM";
-    distFromBoundary = Math.min(score - lightMedium, mediumHeavy - score);
-  } else {
-    tier = "HEAVY";
-    distFromBoundary = score - mediumHeavy;
-  }
-
-  const confidence = 1 / (1 + Math.exp(-s.confidenceSteepness * distFromBoundary));
-
-  if (confidence < s.confidenceThreshold) {
-    return decide("MEDIUM", { confidence, reasoning: "ambiguous→medium" });
-  }
-
-  return decide(tier, { confidence, reasoning: "scored" });
+  return scorer.classify(text, estimatedTokens, config.scoring, config.tiers);
 }
 
 // ─── Extract scoring text from OpenAI Chat Completions messages format ───
 
-// OpenAI shape: messages: [{role, content}] where content is string OR
-// content parts array (`[{type:"text", text:...}]`). For vision it's also
-// `{type:"image_url", image_url:{url}}` — we skip those for scoring.
-// We skip messages with role "system" (the system prompt) and the first
-// few "assistant" turns — same exclusion rule as before: only score what
-// the user is asking about right now.
 function extractText(body) {
-  let text = "";
-  if (Array.isArray(body.messages)) {
-    const recent = body.messages.slice(-3);
-    for (const msg of recent) {
-      if (msg.role && msg.role !== "user") continue;
-      const c = msg.content;
-      if (typeof c === "string") {
-        text += c + " ";
-      } else if (Array.isArray(c)) {
-        for (const part of c) {
-          if (part.type === "text" && typeof part.text === "string") {
-            text += part.text + " ";
-          }
-        }
-      }
-    }
-  }
-  return text;
+  return scorer.extractText(body);
 }
 
 // ─── Proxy upstream ───
 
-// Strip non-printable / ANSI / control chars before logging user content —
-// defense against terminal-escape log injection.
 function stripUnsafe(s) {
-  // eslint-disable-next-line no-control-regex
-  return String(s).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+  return scorer.stripUnsafe(s);
 }
 
-// Resolve an explicit (non-"auto") model id to a provider.
-// Convention: client may pass "provider/model" (e.g. "openai/gpt-5.1"), or
-// just "model" — bare ids are only valid if they match a tier entry under
-// the default provider. Anything else is rejected — we no longer silently
-// route to a provider the user didn't pick.
 function resolveExplicitModel(modelId) {
-  if (typeof modelId !== "string" || !modelId) return null;
-  if (modelId.includes("/")) {
-    const [provider, ...rest] = modelId.split("/");
-    if (config.providers[provider] && rest.length) {
-      return { provider, model: rest.join("/"), stripThinking: false };
-    }
-    return null;
-  }
-  for (const t of ["LIGHT", "MEDIUM", "HEAVY"]) {
-    const spec = config.tiers[t];
-    if (spec && spec.provider === config.defaultProvider && spec.model === modelId) {
-      return { provider: spec.provider, model: spec.model, stripThinking: spec.stripThinking };
-    }
-  }
-  return null;
+  return scorer.resolveExplicitModel(modelId, config.defaultProvider, config.providers, config.tiers);
 }
 
-// Resolve the API key for a provider: prefer env var if apiKeyEnv is set;
-// else fall back to literal apiKey in config (useful for local Ollama/llama.cpp
-// where there's no key). When both are missing, the request goes out without
-// Authorization — which is correct for local-only servers.
 function providerKey(provider) {
-  if (provider.apiKeyEnv && process.env[provider.apiKeyEnv]) {
-    return process.env[provider.apiKeyEnv];
-  }
-  return provider.apiKey || null;
+  return scorer.providerKey(provider, process.env);
 }
 
 // stripThinking: for Ollama/llama.cpp the `reasoning_effort`-style controls are

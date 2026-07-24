@@ -1,7 +1,7 @@
 {
   "name": "openclaw-router",
   "version": "0.2.0",
-  "description": "Cost-optimizing OpenAI Chat Completions router for OpenClaw",
+  "description": "Cost-optimizing OpenAI Chat Completions router for OpenClaw. Local-first, zero deps, plugin-shaped.",
   "main": "server.js",
   "private": true,
   "engines": {
@@ -9,6 +9,11 @@
   },
   "scripts": {
     "start": "node server.js",
-    "smoke": "node --check server.js && bash -n scripts/install.sh && bash -n scripts/uninstall.sh"
+    "test": "node --test test/scorer.test.js",
+    "smoke": "node --check server.js && node --check router/scorer.js && bash -n scripts/install.sh && bash -n scripts/uninstall.sh"
+  },
+  "openclaw": {
+    "plugin": "./openclaw.plugin.json",
+    "security": "./openclaw.security.json"
   }
 }
