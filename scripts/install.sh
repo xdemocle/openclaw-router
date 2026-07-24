@@ -1,4 +1,31 @@
 #!/usr/bin/env bash
+#
+# openclaw-router installer — supports both OpenClaw config layouts:
+#
+#   • Modern ($include-router, srv3+): openclaw.json is mostly a thin include
+#     router pointing at configs/*.json5. We register the router provider in
+#     configs/models.json5 + add to the model allowlist in configs/agents.json5.
+#     openclaw.json itself is NEVER modified.
+#
+#   • Legacy (pre-2026.6, ibl.ai fork baseline): openclaw.json holds the full
+#     config inline. We register directly under openclaw.json["models"] as
+#     before.
+#
+# The layout is detected automatically. The script is idempotent — running
+# it twice is safe.
+#
+# JSON5 files: openclaw configs use JSON5 with // comments, trailing commas,
+# and unquoted keys (e.g. "subagents: { allowAgents: ... }"). We do NOT
+# round-trip the file through json.dumps (would lose comments / unquoted keys).
+# Instead, we do surgical text-level edits: regex-locate the section to
+# mutate, parse just that subsection, mutate the parsed dict, re-serialize
+# it cleanly back into the file.
+#
+# Identity: this script uses `sudo` for system-level writes (systemd, env
+# file). Operators may need to provide sudo access. We do NOT print or
+# persist any provider API keys — only the operator-supplied env vars at
+# install time are written into /etc/openclaw-router.env (chmod 0600).
+#
 set -euo pipefail
 
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -8,10 +35,9 @@ PORT=8402
 
 echo "⚡ Installing openclaw-router..."
 
-# 1. Copy router files
+# ─── 1. Copy router files ──────────────────────────────────────────────────
 mkdir -p "$ROUTER_DIR"
 cp "$SKILL_DIR/server.js" "$ROUTER_DIR/server.js"
-
 if [ ! -f "$ROUTER_DIR/config.json" ]; then
   cp "$SKILL_DIR/config.json" "$ROUTER_DIR/config.json"
   echo "  ✓ Copied default config.json"
@@ -20,28 +46,370 @@ else
 fi
 echo "  ✓ Copied server.js to $ROUTER_DIR"
 
-# 2. Detect OpenAI key (best-effort, for the OpenAI HEAVY tier default).
-#    Local providers (Ollama/llama.cpp) need no key. Other keys are pass-through.
+# ─── 2. Detect OpenClaw config layout ──────────────────────────────────────
+#
+# mode=include-router: most top-level values are { "$include": "..." }
+#                      (srv3+). We register via configs/models.json5 +
+#                      configs/agents.json5. openclaw.json itself is
+#                      NEVER modified.
+# mode=flat:          openclaw.json holds the full config (legacy).
+#
+OPENCLAW_JSON="$HOME/.openclaw/openclaw.json"
+OPENCLAW_MODE="flat"
+if [ -f "$OPENCLAW_JSON" ]; then
+  # `python3 -c` on the JSON: majority of top-level values are
+  # { "$include": "..." } → include-router. We require ≥80% to avoid
+  # mis-detecting files that just happen to have a few includes.
+  OPENCLAW_MODE=$(python3 - "$OPENCLAW_JSON" <<'PYEOF' || echo "flat"
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    if isinstance(cfg, dict) and cfg:
+        total = len(cfg)
+        inc = sum(
+            1 for v in cfg.values()
+            if isinstance(v, dict) and set(v.keys()) == {"$include"}
+        )
+        print("include-router" if (inc / total) >= 0.8 else "flat")
+    else:
+        print("flat")
+except Exception:
+    print("flat")
+PYEOF
+)
+fi
+
+case "$OPENCLAW_MODE" in
+  include-router)
+    CONFIGS_DIR="$HOME/.openclaw/configs"
+    MODELS_FILE="$CONFIGS_DIR/models.json5"
+    AGENTS_FILE="$CONFIGS_DIR/agents.json5"
+    ;;
+  flat)
+    MODELS_FILE="$OPENCLAW_JSON"
+    AGENTS_FILE="$OPENCLAW_JSON"
+    ;;
+  *)
+    echo "  ✗ Unknown OpenClaw mode: $OPENCLAW_MODE — refusing to touch config."
+    exit 1
+    ;;
+esac
+echo "  ✓ Detected OpenClaw mode: $OPENCLAW_MODE (writes go to: $(basename "$MODELS_FILE"), $(basename "$AGENTS_FILE"))"
+
+# ─── 3. Detect API key (best-effort) ───────────────────────────────────────
+#
+# Modern: ~/.openclaw/secrets.jsonc — raw provider keys live at
+#   secrets.models.providers.<id>.apiKey.
+# Legacy: ~/.openclaw/agents/main/agent/auth-profiles.json — flat JSON.
+# Env:    always wins if set.
+#
 API_KEY=""
-AUTH_FILE="$HOME/.openclaw/agents/main/agent/auth-profiles.json"
-if [ -f "$AUTH_FILE" ]; then
-  API_KEY=$(grep -o '"key": "[^"]*"' "$AUTH_FILE" 2>/dev/null | head -1 | cut -d'"' -f4 || true)
+if [ -n "${OPENAI_API_KEY:-}" ]; then
+  API_KEY="$OPENAI_API_KEY"
+  echo "  ✓ Using OPENAI_API_KEY from environment"
+elif [ -f "$HOME/.openclaw/secrets.jsonc" ]; then
+  # secrets.jsonc is JSON5; strip // comments before parsing. The apiKey value
+  # under models.providers.openai is the raw sk-... string.
+  API_KEY=$(python3 - "$HOME/.openclaw/secrets.jsonc" <<'PYEOF' 2>/dev/null || true
+import json, re, sys
+try:
+    text = open(sys.argv[1]).read()
+    def strip_json5_comments(text):
+    out = []
+    i = 0
+    in_string = False
+    in_comment_line = False
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if in_comment_line:
+            if c == "\n":
+                in_comment_line = False
+                out.append(c)
+            i += 1
+            continue
+        if in_string:
+            if c == "\\":
+                out.append(c); i += 1
+                if i < n:
+                    out.append(text[i]); i += 1
+                continue
+            if c == '"':
+                in_string = False
+                out.append(c); i += 1; continue
+            out.append(c); i += 1; continue
+        if c == '"':
+            in_string = True
+            out.append(c); i += 1; continue
+        if c == "/" and i + 1 < n and text[i+1] == "/":
+            in_comment_line = True
+            i += 2; continue
+        out.append(c); i += 1
+    return "".join(out)
+text = strip_json5_comments(text)
+    text = re.sub(r",\s*([\}\]])", r"\1", text)
+    cfg = json.loads(text)
+    print(cfg.get("models", {}).get("providers", {}).get("openai", {}).get("apiKey", "") or "")
+except Exception:
+    print("")
+PYEOF
+)
+  if [ -n "$API_KEY" ]; then
+    echo "  ✓ Detected OpenAI key from secrets.jsonc"
+  fi
+elif [ -f "$HOME/.openclaw/agents/main/agent/auth-profiles.json" ]; then
+  # Legacy: the very first "key": "..." field of auth-profiles.json. Note: this
+  # file does NOT exist on srv3+ layouts (where auth moved to secrets.jsonc).
+  API_KEY=$(grep -o '"key":[[:space:]]*"[^"]*"' "$HOME/.openclaw/agents/main/agent/auth-profiles.json" 2>/dev/null | head -1 | sed -E 's/.*"([^"]*)"$/\1/' || true)
+  if [ -n "$API_KEY" ]; then
+    echo "  ✓ Detected API key from auth-profiles.json (legacy)"
+  fi
 fi
 
 if [ -z "$API_KEY" ]; then
-  echo ""
-  echo "  ℹ No API key auto-detected. openclaw-router will work for local-only"
-  echo "    tiers (Ollama/llama.cpp). Set OPENAI_API_KEY in the systemd service"
+  echo "  ℹ No OpenAI key detected. openclaw-router will work for local-only tiers"
+  echo "    (Ollama/llama.cpp). Set OPENAI_API_KEY or write it to secrets.jsonc"
   echo "    if you want to route to cloud HEAVY tier."
-  API_KEY=""
 fi
 
-# 3. Capture any provider keys / host overrides set in the installer
-#    environment. We use python3 to safely escape values for systemd
-#    Environment= directives (a value with a newline or quote would
-#    otherwise inject extra directives or break the unit file).
+# ─── 4. Register the router provider ───────────────────────────────────────
+#
+# Two-way registration depending on detected mode. JSON5-aware: we use
+# regex-based surgical edits so comments / unquoted keys / trailing commas
+# in the file are preserved.
+#
+if [ ! -f "$MODELS_FILE" ]; then
+  echo "  ✗ Expected config file missing: $MODELS_FILE — aborting registration."
+  echo "    (If this is a fresh OpenClaw install, run 'openclaw init' first.)"
+  exit 1
+fi
+
+# Backup the files we're about to touch — matches the .bak convention.
+ts="$(date +%Y%m%d%H%M%S)"
+if [ ! -f "${MODELS_FILE}.bak" ]; then
+  cp "$MODELS_FILE" "${MODELS_FILE}.bak"
+  echo "  ✓ Backed up $MODELS_FILE → ${MODELS_FILE}.bak"
+fi
+if [ "$AGENTS_FILE" != "$MODELS_FILE" ] && [ ! -f "${AGENTS_FILE}.bak" ]; then
+  cp "$AGENTS_FILE" "${AGENTS_FILE}.bak"
+  echo "  ✓ Backed up $AGENTS_FILE → ${AGENTS_FILE}.bak"
+fi
+
+# Provider block to inject. Shape matches the existing providers in
+# configs/models.json5 (anthropic, openai, ollama, etc.) — `api`, `baseUrl`,
+# `apiKey`, `models[]` of full model objects with `id`/`name`/etc.
+{ read -r -d '' ROUTER_PROVIDER_JSON || true; } <<'JSON'
+{
+  "api": "openai-completions",
+  "baseUrl": "http://127.0.0.1:__PORT__",
+  "apiKey": "passthrough",
+  "models": [
+    {
+      "id": "auto",
+      "name": "openclaw-router (auto)",
+      "contextWindow": 128000,
+      "maxTokens": 8192,
+      "input": ["text"],
+      "reasoning": true,
+      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+    }
+  ]
+}
+JSON
+ROUTER_PROVIDER_JSON="${ROUTER_PROVIDER_JSON//__PORT__/$PORT}"
+
+if [ "$OPENCLAW_MODE" = "include-router" ]; then
+  # ─── Modern ($include-router, srv3+) ───────────────────────────────────
+  # Edit configs/models.json5: inject "openclaw-router" into the providers map.
+  # Edit configs/agents.json5: add "openclaw-router/auto" to defaults.models.
+  # Both files are JSON5; we do surgical edits to preserve the rest.
+  set +e
+  python3 - "$MODELS_FILE" "$AGENTS_FILE" "$ROUTER_PROVIDER_JSON" <<'PYEOF'
+import json, re, sys
+from pathlib import Path
+
+models_path, agents_path, provider_json_str = sys.argv[1:4]
+PROVIDER_NAME = "openclaw-router"
+ALLOW_KEY = "openclaw-router/auto"
+
+def strip_json5_comments(text):
+    """Strip // comments, but only outside of strings (URLs etc. contain //)."""
+    out = []
+    i = 0
+    in_string = False
+    in_comment_line = False
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if in_comment_line:
+            if c == "\n":
+                in_comment_line = False
+                out.append(c)
+            i += 1
+            continue
+        if in_string:
+            if c == "\\":
+                out.append(c); i += 1
+                if i < n:
+                    out.append(text[i]); i += 1
+                continue
+            if c == '"':
+                in_string = False
+                out.append(c); i += 1; continue
+            out.append(c); i += 1; continue
+        if c == '"':
+            in_string = True
+            out.append(c); i += 1; continue
+        if c == "/" and i + 1 < n and text[i+1] == "/":
+            in_comment_line = True
+            i += 2; continue
+        out.append(c); i += 1
+    return "".join(out)
+
+def load_json5(p):
+    text = Path(p).read_text()
+    text_no_comments = strip_json5_comments(text)
+    return text, json.loads(re.sub(r",\s*([\}\]])", r"\1", text_no_comments))
+
+def add_provider_to_models(models_path, provider_name, provider_dict):
+    """Surgically insert `"provider_name": {...},` into the providers map.
+    Idempotent: returns 'added' or 'present'. The full inserted value is the
+    JSON-serialized provider_dict (without trailing comma — caller adds one).
+    """
+    text, cfg = load_json5(models_path)
+    providers = cfg.get("providers", {})
+    if provider_name in providers:
+        return "present"
+    # Find the closing `}` of the providers object. We locate the line that
+    # starts with `providers: {` and walk braces from there.
+    # This avoids touching the rest of the file (comments / unrelated keys).
+    m = re.search(r'^\s*"providers"\s*:\s*\{', text, re.M)
+    if not m:
+        # No providers block — fail loud, operator should inspect.
+        raise RuntimeError(f"No 'providers' block found in {models_path}")
+    start = m.end()
+    depth = 1
+    i = start
+    while i < len(text) and depth > 0:
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        i += 1
+    # i now points just past the closing `}`. Insert our entry before it.
+    insert_at = i - 1
+    body = json.dumps(provider_dict, indent=2)
+    # Determine if a trailing comma is needed BEFORE our entry. Look at the
+    # character just before our insertion point: if it's `,` we're already
+    # preceded by a comma; otherwise we add one.
+    prev_char = text[insert_at - 1]
+    leading = "," if prev_char != "," else ""
+    new_block = f'{leading}\n    "{provider_name}": {body},\n  '
+    new_text = text[:insert_at] + new_block + text[insert_at:]
+    Path(models_path).write_text(new_text)
+    return "added"
+
+def add_to_allowlist(agents_path, key):
+    """Insert `"key": {},` into the agents.defaults.models map.
+    Idempotent. PURE-TEXT surgical edit; the agents.json5 file may contain
+    JSON5 features (unquoted keys like `subagents:`) that break json.load.
+    We only need to find the `"models": { ... }` block under `defaults`,
+    which is plain JSON, and inject our entry before its closing `}`.
+    """
+    text = Path(agents_path).read_text()
+    # Idempotency: scan the existing block for the key. We do a simple
+    # substring check inside the models block (between `"models": {` and
+    # its matching `}`).
+    m = re.search(r'"models"\s*:\s*\{', text)
+    if not m:
+        raise RuntimeError(f"No 'models' block under defaults in {agents_path}")
+    start = m.end()
+    depth = 1
+    i = start
+    while i < len(text) and depth > 0:
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        i += 1
+    end = i  # past the closing `}`
+    block = text[start:end - 1]
+    if (f'"{key}"' in block) or (f"\'{key}\'" in block):
+        return "present"
+    # Find the position of the last meaningful entry (last `}` before our
+    # closing brace). Insert our entry before that `}`.
+    # We can simply insert before end - 1 (the closing `}` position).
+    insert_at = end - 1
+    # Detect indentation of existing entries to match.
+    # Look at last few lines of block.
+    last_lines = block.rstrip().splitlines()
+    indent = "      "  # default 6 spaces (matches "      \"anthropic/...")
+    for line in reversed(last_lines):
+        stripped = line.lstrip()
+        if stripped and not stripped.startswith("//"):
+            indent = line[:len(line) - len(stripped)]
+            break
+    new_entry = f'\n{indent}"{key}": {{}},'
+    # If the previous char in text is already `,` we don't add another.
+    prev_char = text[insert_at - 1]
+    if prev_char == ",":
+        new_entry = f'\n{indent}"{key}": {{}}'
+    new_text = text[:insert_at] + new_entry + text[insert_at:]
+    Path(agents_path).write_text(new_text)
+    return "added"
+
+provider_dict = json.loads(provider_json_str)
+
+status = add_provider_to_models(models_path, PROVIDER_NAME, provider_dict)
+if status == "added":
+    print(f"  ✓ Registered '{PROVIDER_NAME}' provider in {Path(models_path).name}")
+else:
+    print(f"  ✓ Provider '{PROVIDER_NAME}' already registered in {Path(models_path).name}")
+
+if agents_path != models_path:
+    status = add_to_allowlist(agents_path, ALLOW_KEY)
+    if status == "added":
+        print(f"  ✓ Added '{ALLOW_KEY}' to {Path(agents_path).name} allowlist")
+    else:
+        print(f"  ✓ '{ALLOW_KEY}' already in {Path(agents_path).name} allowlist")
+PYEOF
+  PY_RC=$?
+  set -e
+  if [ "$PY_RC" -ne 0 ]; then
+    echo "  ✗ Registration step failed (python exit $PY_RC). Restore from .bak to roll back."
+    exit $PY_RC
+  fi
+else
+  # ─── Legacy (flat openclaw.json) ─────────────────────────────────────
+  python3 - "$MODELS_FILE" "$ROUTER_PROVIDER_JSON" <<'PYEOF'
+import json, sys
+from pathlib import Path
+p, provider_json_str = sys.argv[1], sys.argv[2]
+cfg = json.loads(Path(p).read_text())
+providers = cfg.setdefault("models", {}).setdefault("providers", {})
+if "openclaw-router" not in providers:
+    providers["openclaw-router"] = json.loads(provider_json_str)
+    print(f"  ✓ Registered 'openclaw-router' provider in {Path(p).name}")
+else:
+    print(f"  ✓ Provider already registered in {Path(p).name}")
+allowlist = cfg.get("agents", {}).get("defaults", {}).get("models")
+if isinstance(allowlist, dict) and "openclaw-router/auto" not in allowlist:
+    allowlist["openclaw-router/auto"] = {}
+    print(f"  ✓ Added 'openclaw-router/auto' to {Path(p).name} model allowlist")
+Path(p).write_text(json.dumps(cfg, indent=2) + "\n")
+PYEOF
+fi
+
+# ─── 5. Capture provider env vars for the systemd unit ────────────────────
+# All values are written to /etc/openclaw-router.env (chmod 0600); the unit
+# references them via EnvironmentFile=. We use printf %q for safe escaping
+# and reject any value containing a newline / CR — never write those into a
+# systemd unit (would smuggle directives).
 EXTRA_ENV_FILE="$(mktemp)"
-python3 - "$EXTRA_ENV_FILE" << 'PYEOF'
+python3 - "$EXTRA_ENV_FILE" <<'PYEOF'
 import os, sys
 out_path = sys.argv[1]
 provider_envs = [
@@ -53,30 +421,27 @@ with open(out_path, "w") as f:
         val = os.environ.get(v)
         if val is None or val == "":
             continue
-        # Escape backslashes and double quotes for systemd syntax.
         esc = val.replace("\\", "\\\\").replace("\"", "\\\"")
-        # Reject any value containing a newline / carriage return — never
-        # inject those into a systemd unit (would smuggle directives).
         if "\n" in esc or "\r" in esc:
             print(f"  ⚠ Refusing to write {v}: value contains newline/CR", file=sys.stderr)
             continue
-        f.write(f'Environment={v}="{esc}"\n')
+        f.write(f'{v}="{esc}"\n')
 PYEOF
 EXTRA_ENV="$(cat "$EXTRA_ENV_FILE" 2>/dev/null || true)"
 rm -f "$EXTRA_ENV_FILE"
 if [ -n "$EXTRA_ENV" ]; then
   echo "$EXTRA_ENV" | while IFS= read -r line; do
     var_name="${line%%=*}"
-    echo "  ✓ Passing through ${var_name#Environment=}"
+    echo "  ✓ Passing through $var_name"
   done
 fi
 
-# 4. Create systemd service.
+# ─── 6. Create systemd service ────────────────────────────────────────────
 # We build the unit file by composition:
-#   1. A static header herestrung with `printf` (substitute real paths now)
+#   1. Static header herestrung with `printf` (real paths substituted)
 #   2. An env-file written by a python heredoc that filters newline/CR
 #   3. The unit references the env-file via `EnvironmentFile=`
-# Net: the unit file body has zero unquoted shell interpolation in it.
+# Net: the unit file body has zero unquoted shell interpolation.
 NODE_BIN=$(which node)
 ENV_FILE="/etc/openclaw-router.env"
 TMP_ENV="$(mktemp)"
@@ -96,11 +461,8 @@ STATIC
 sudo install -m 0600 "$TMP_ENV" "$ENV_FILE"
 rm -f "$TMP_ENV"
 
-# Build the unit file via printf — values that *need* expansion ($NODE_BIN,
-# $ENV_FILE, $ROUTER_DIR) are passed as printf arguments. There is no
-# unquoted heredoc that could swallow a malicious env value.
 UNIT_FILE="$(mktemp)"
-sudo python3 - "$UNIT_FILE" "$NODE_BIN" "$ENV_FILE" "$ROUTER_DIR" << 'PYEOF'
+sudo python3 - "$UNIT_FILE" "$NODE_BIN" "$ENV_FILE" "$ROUTER_DIR" <<'PYEOF'
 import sys, os
 out, node_bin, env_file, router_dir = sys.argv[1:5]
 content = f"""[Unit]
@@ -125,12 +487,11 @@ sudo install -m 0644 "$UNIT_FILE" /etc/systemd/system/$SERVICE_NAME.service
 rm -f "$UNIT_FILE"
 echo "  ✓ Created systemd service (env file: $ENV_FILE)"
 
-# 5. Start the service
+# ─── 7. Start the service ─────────────────────────────────────────────────
 sudo systemctl daemon-reload
 sudo systemctl enable --now "$SERVICE_NAME"
 echo "  ✓ Service started on port $PORT"
 
-# 6. Wait for it to be ready
 sleep 1
 if curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
   echo "  ✓ Health check passed"
@@ -138,63 +499,22 @@ else
   echo "  ⚠ Service started but health check failed — check: journalctl -u $SERVICE_NAME -f"
 fi
 
-# 7. Register with OpenClaw config
-OPENCLAW_JSON="$HOME/.openclaw/openclaw.json"
-if [ -f "$OPENCLAW_JSON" ] && command -v python3 &> /dev/null; then
-  python3 - "$OPENCLAW_JSON" "$PORT" << 'PYEOF'
-import json, sys
-
-config_path, port = sys.argv[1], sys.argv[2]
-with open(config_path) as f:
-    cfg = json.load(f)
-
-# Add model provider.
-# Note: api is "openai-chat-completions" — OpenClaw calls it with the OpenAI
-# body shape, router picks tier + proxies. Streaming works via SSE passthrough.
-providers = cfg.setdefault("models", {}).setdefault("providers", {})
-if "openclaw-router" not in providers:
-    providers["openclaw-router"] = {
-        "baseUrl": f"http://127.0.0.1:{port}",
-        "apiKey": "passthrough",
-        "api": "openai-chat-completions",
-        "models": [{
-            "id": "auto",
-            "name": "openclaw-router (auto)",
-            "reasoning": True,
-            "input": ["text"],
-            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-            "contextWindow": 128000,
-            "maxTokens": 8192
-        }]
-    }
-    print("  ✓ Registered model provider in openclaw.json")
-else:
-    print("  ✓ Model provider already registered")
-
-# Add to model allowlist (agents.defaults.models) if it exists
-models_allowlist = cfg.get("agents", {}).get("defaults", {}).get("models")
-if models_allowlist is not None and "openclaw-router/auto" not in models_allowlist:
-    models_allowlist["openclaw-router/auto"] = {}
-    print("  ✓ Added openclaw-router/auto to model allowlist")
-
-with open(config_path, "w") as f:
-    json.dump(cfg, f, indent=2)
-    f.write("\n")
-PYEOF
-  echo ""
-  echo "  ⚠ Restart OpenClaw to pick up the new model provider:"
-  echo "    openclaw gateway restart"
-  echo "    # or: /config reload (from chat)"
-  echo "    # or: kill -USR1 \$(pgrep -f 'openclaw.*gateway')"
-else
-  echo ""
-  echo "  Now register the model in your OpenClaw session:"
-  echo ""
-  echo '  /config set models.providers.openclaw-router.baseUrl http://127.0.0.1:'"$PORT"
-  echo '  /config set models.providers.openclaw-router.api openai-chat-completions'
-  echo '  /config set models.providers.openclaw-router.apiKey passthrough'
-  echo '  /config set models.providers.openclaw-router.models [{"id":"auto","name":"openclaw-router (auto)","reasoning":true,"input":["text"],"contextWindow":128000,"maxTokens":8192}]'
-fi
+# ─── 8. Final restart hint ────────────────────────────────────────────────
+echo ""
+case "$OPENCLAW_MODE" in
+  include-router)
+    echo "  ⚠ Restart OpenClaw to pick up the new provider:"
+    echo "    systemctl --user restart openclaw-gateway.service"
+    echo "    # or, if hot-reload is on:"
+    echo "    /config reload    (from chat)"
+    ;;
+  flat)
+    echo "  ⚠ Restart OpenClaw to pick up the new model provider:"
+    echo "    openclaw gateway restart"
+    echo "    # or: /config reload (from chat)"
+    echo "    # or: kill -USR1 \$(pgrep -f 'openclaw.*gateway')"
+    ;;
+esac
 echo ""
 echo "  Then use: /model openclaw-router/auto"
 echo ""
