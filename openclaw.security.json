@@ -1,0 +1,111 @@
+{
+  "$schema": "https://openclaw.ai/schemas/plugin-security.json",
+  "version": "1.0",
+  "plugin": "openclaw-router",
+  "description": "Local-only LLM router. Zero network egress beyond explicitly-configured upstream baseUrl. No telemetry, no wallet, no payment processing.",
+  "expectedBehaviors": [
+    {
+      "type": "fs-read",
+      "path": "{ROUTER_CONFIG}",
+      "purpose": "Read scoring + tiers + providers config. Hot-reloaded every 2s.",
+      "justification": "The router is config-driven; without reading config there is no scoring or routing.",
+      "dataFlow": "local-only",
+      "networkTransmission": false
+    },
+    {
+      "type": "fs-read",
+      "path": "scripts/install.sh",
+      "purpose": "Installer reads scripts/install.sh to copy server.js + config.json into ~/.openclaw/workspace/skills/router/.",
+      "justification": "Install path is set by the operator; the script reads its own source location via $0.",
+      "dataFlow": "local-only",
+      "networkTransmission": false
+    },
+    {
+      "type": "fs-write",
+      "path": "/etc/systemd/system/openclaw-router.service",
+      "purpose": "Install script writes the systemd unit so the router starts on boot.",
+      "justification": "Standard OpenClaw plugin installation pattern. The script requires sudo at install time per operator consent.",
+      "dataFlow": "local-only",
+      "networkTransmission": false
+    },
+    {
+      "type": "fs-write",
+      "path": "/etc/openclaw-router.env",
+      "purpose": "Installer writes the operator-chosen env values (API keys, host overrides) to a 0600 file the systemd unit reads via EnvironmentFile=.",
+      "justification": "Avoids embedding env values in the unit file body (and the bash subshell that writes it). The file is chmod 0600.",
+      "dataFlow": "local-only",
+      "networkTransmission": false
+    },
+    {
+      "type": "fs-write",
+      "path": "{$HOME}/.openclaw/openclaw.json",
+      "purpose": "Install script edits the OpenClaw gateway config to register 'openclaw-router' as a model provider with api='openai-chat-completions'.",
+      "justification": "Required for OpenClaw to discover the router. Idempotent — only adds if missing.",
+      "dataFlow": "local-only",
+      "networkTransmission": false
+    },
+    {
+      "type": "env-read",
+      "variable": "OPENAI_API_KEY",
+      "purpose": "Read at runtime to attach Authorization: Bearer header to upstream OpenAI requests.",
+      "justification": "Operator-supplied key. Never written to disk in plaintext by the router (read from env at request time).",
+      "dataFlow": "transient-memory",
+      "networkTransmission": true
+    },
+    {
+      "type": "env-read",
+      "variable": "OPENROUTER_API_KEY",
+      "purpose": "Bearer key for OpenRouter upstream tier.",
+      "justification": "Same as above. Only read if the provider's apiKeyEnv matches.",
+      "dataFlow": "transient-memory",
+      "networkTransmission": true
+    },
+    {
+      "type": "env-read",
+      "variable": "ZAI_API_KEY",
+      "purpose": "Bearer key for z.ai GLM upstream tier.",
+      "justification": "Same as above.",
+      "dataFlow": "transient-memory",
+      "networkTransmission": true
+    },
+    {
+      "type": "env-read",
+      "variable": "MOONSHOT_API_KEY",
+      "purpose": "Bearer key for Moonshot Kimi upstream tier.",
+      "justification": "Same as above.",
+      "dataFlow": "transient-memory",
+      "networkTransmission": true
+    },
+    {
+      "type": "network-egress",
+      "destination": "{provider.baseUrl}",
+      "purpose": "Proxy each AI request to the upstream selected by the scorer.",
+      "justification": "The router's only purpose. baseUrl is operator-controlled via config.json. Default config has only public LLM endpoints + 127.0.0.1. An upstreamAllowlist field is documented (config.json) but not enforced; design choice pending operator policy.",
+      "dataFlow": "request-and-response",
+      "networkTransmission": true
+    },
+    {
+      "type": "process-spawn",
+      "command": "node {$HOME}/.openclaw/workspace/skills/router/server.js",
+      "purpose": "Started by systemd as the openclaw-router.service unit; binds 127.0.0.1:8402 only.",
+      "justification": "Localhost-only listener. No external binding.",
+      "dataFlow": "local-only",
+      "networkTransmission": false
+    }
+  ],
+  "securityNotes": [
+    "The router is bound to 127.0.0.1 only — not reachable from external hosts.",
+    "API keys are read from env at request time, never written to disk by the router process.",
+    "config.json is the operator's contract. The router hot-reloads it but the file's permissions are entirely the operator's responsibility.",
+    "The router does NOT enforce an upstream URL allowlist today. The config schema documents an `upstreamAllowlist` field as a TODO. Operators running on shared hosts should deploy with an outbound proxy or OS-level network policy (e.g. nftables) to constrain the router's egress.",
+    "Request bodies are capped at 10 MiB (ROUTER_MAX_BODY env to override). Upstream sockets are capped at 120s/request. Listener at 5min/connection.",
+    "systemd's EnvironmentFile= is used (not inline Environment= directives) so env values are not exposed to the bash process that writes the unit file.",
+    "No telemetry, no analytics, no external telemetry endpoints. The router does not phone home.",
+    "No subprocess invocations from the server runtime. The install.sh script is operator-run only."
+  ],
+  "references": [
+    "https://openclaw.ai/schemas/plugin-security.json",
+    "https://github.com/xdemocle/openclaw-router",
+    "https://github.com/BlockRunAI/ClawRouter (inspiration for the plugin schema; we do not use it)"
+  ]
+}

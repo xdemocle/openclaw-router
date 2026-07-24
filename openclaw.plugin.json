@@ -1,0 +1,76 @@
+{
+  "id": "openclaw-router",
+  "name": "openclaw-router",
+  "description": "Local cost-optimizing LLM router for OpenClaw. Routes between local Ollama / llama.cpp and hosted OpenAI-compatible upstreams per request, via a 14-dimension weighted scorer. Zero external deps. Anthropic-format support removed; OpenAI Chat Completions only.",
+  "version": "0.2.0",
+  "skills": ["./SKILL.md"],
+  "activation": {
+    "onStartup": false,
+    "onInstall": true
+  },
+  "enabledByDefault": true,
+  "providers": ["openclaw-router"],
+  "compat": {
+    "pluginApiRange": ">=2026.3.24",
+    "minGatewayVersion": "2026.5.2"
+  },
+  "contracts": {
+    "models": [
+      {
+        "id": "auto",
+        "name": "openclaw-router (auto)",
+        "reasoning": true,
+        "input": ["text"],
+        "contextWindow": 128000,
+        "maxTokens": 8192
+      }
+    ],
+    "apiSpec": "openai-chat-completions"
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "providers": {
+        "type": "object",
+        "description": "Per-provider upstream config. Each entry: { baseUrl, auth: bearer|none, apiKeyEnv? }",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "baseUrl": { "type": "string" },
+            "auth": { "type": "string", "enum": ["bearer", "none"] },
+            "apiKeyEnv": { "type": "string" },
+            "format": { "type": "string", "enum": ["openai"] }
+          },
+          "required": ["baseUrl", "auth"]
+        }
+      },
+      "models": {
+        "type": "object",
+        "description": "Tier model assignments. Each tier is either a bare model id (uses defaultProvider) or { provider, model, stripThinking? }."
+      },
+      "scoring": {
+        "type": "object",
+        "description": "14-dim scorer config (weights, boundaries, keyword lists, overrides)."
+      },
+      "costs": {
+        "type": "object",
+        "description": "Cost per 1M tokens keyed by `${provider}/${model}`."
+      },
+      "upstreamAllowlist": {
+        "type": "array",
+        "description": "TODO (deferred). When enforced, provider.baseUrl hostnames must match one of these patterns. Empty = trust operator (default config only).",
+        "items": { "type": "string" }
+      }
+    }
+  },
+  "uiHints": {
+    "providers": {
+      "label": "Upstream providers",
+      "description": "Local-only mode if no apiKeyEnv is set anywhere."
+    },
+    "scoring": {
+      "label": "Scoring rules",
+      "description": "Edit weights and keyword lists to bias which tier handles a request."
+    }
+  }
+}
