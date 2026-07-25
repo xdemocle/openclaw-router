@@ -89,6 +89,8 @@ PORT=8402
 if [ "$DRY_RUN" = "1" ]; then
   noop "mkdir -p $ROUTER_DIR"
   noop "cp $SKILL_DIR/server.js → $ROUTER_DIR/server.js"
+  noop "cp $SKILL_DIR/router/scorer.js → $ROUTER_DIR/router/scorer.js"
+  noop "cp package.json (CJS marker) → $ROUTER_DIR/package.json  # blocks ~/package.json ESM pollution"
   if [ ! -f "$ROUTER_DIR/config.json" ]; then
     noop "cp $SKILL_DIR/config.json → $ROUTER_DIR/config.json (new)"
     echo "  ✓ Would copy default config.json"
@@ -99,13 +101,20 @@ if [ "$DRY_RUN" = "1" ]; then
 else
   mkdir -p "$ROUTER_DIR"
   cp "$SKILL_DIR/server.js" "$ROUTER_DIR/server.js"
+  mkdir -p "$ROUTER_DIR/router"
+  cp "$SKILL_DIR/router/scorer.js" "$ROUTER_DIR/router/scorer.js"
+  # Drop a local package.json that pins CommonJS. Without this, Node walks up
+  # from ROUTER_DIR to ~/package.json (which has "type":"module" on srv3)
+  # and refuses server.js's require() calls. See:
+  # https://nodejs.org/api/packages.html#packagejson-type-field
+  printf '%s\n' '{ "type": "commonjs" }' > "$ROUTER_DIR/package.json"
   if [ ! -f "$ROUTER_DIR/config.json" ]; then
     cp "$SKILL_DIR/config.json" "$ROUTER_DIR/config.json"
     echo "  ✓ Copied default config.json"
   else
     echo "  ✓ config.json already exists — preserved"
   fi
-  echo "  ✓ Copied server.js to $ROUTER_DIR"
+  echo "  ✓ Copied server.js + package.json (CJS) to $ROUTER_DIR"
 fi
 
 # ─── 2. Detect OpenClaw config layout ──────────────────────────────────────
@@ -547,10 +556,15 @@ fi
 rm -f "$TMP_ENV"
 
 UNIT_FILE="$(mktemp)"
+# Render the systemd unit as the current user. We used to run this as
+# `sudo python3` to write to a file created by `mktemp`, but on hardened
+# Linuxes (AppArmor + restricted /tmp) root can be blocked from overwriting
+# a 0600 user-owned temp file in /tmp. Running as democle avoids that
+# entirely; the file is then handed to `sudo install` which copies it.
 if [ "$DRY_RUN" = "1" ]; then
   noop "would render systemd unit to $UNIT_FILE"
 else
-  sudo python3 - "$UNIT_FILE" "$NODE_BIN" "$ENV_FILE" "$ROUTER_DIR" <<'PYEOF'
+  python3 - "$UNIT_FILE" "$NODE_BIN" "$ENV_FILE" "$ROUTER_DIR" <<'PYEOF'
 import sys, os
 out, node_bin, env_file, router_dir = sys.argv[1:5]
 content = f"""[Unit]
@@ -569,7 +583,7 @@ WantedBy=multi-user.target
 """
 with open(out, "w") as f:
     f.write(content)
-print(f"  ✓ Env file written with {os.path.getsize(env_file) if os.path.exists(env_file) else 0} bytes", file=sys.stderr)
+print(f"  ✓ Systemd unit rendered to {out} ({os.path.getsize(out)} bytes)", file=sys.stderr)
 PYEOF
 fi
 if [ "$DRY_RUN" = "1" ]; then
