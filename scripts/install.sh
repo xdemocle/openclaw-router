@@ -278,10 +278,17 @@ fi
 # Provider block to inject. Shape matches the existing providers in
 # configs/models.json5 (anthropic, openai, ollama, etc.) — `api`, `baseUrl`,
 # `apiKey`, `models[]` of full model objects with `id`/`name`/etc.
+#
+# IMPORTANT: baseUrl MUST include `/v1`. The OpenClaw gateway uses the official
+# OpenAI SDK which appends `/chat/completions` to baseUrl verbatim — it does
+# NOT auto-prepend `/v1`. cerebras/moonshot/xai/deepseek all work because their
+# upstream either accepts both paths or has its own /v1 prefix. Our router only
+# listens on /v1/chat/completions, so without /v1 the gateway POSTs to
+# /chat/completions and gets a 404 → "model not found by the provider".
 { read -r -d '' ROUTER_PROVIDER_JSON || true; } <<'JSON'
 {
   "api": "openai-completions",
-  "baseUrl": "http://127.0.0.1:__PORT__",
+  "baseUrl": "http://127.0.0.1:__PORT__/v1",
   "apiKey": "passthrough",
   "models": [
     {

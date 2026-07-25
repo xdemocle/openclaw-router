@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/scorer.test.js",
+    "test": "node --test test/scorer.test.js test/install.test.js",
     "smoke": "node --check server.js && node --check router/scorer.js && bash -n scripts/install.sh && bash -n scripts/uninstall.sh"
   },
   "openclaw": {
