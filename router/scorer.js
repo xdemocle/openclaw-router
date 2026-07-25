@@ -128,7 +128,23 @@ function classify(text, estimatedTokens, scoreConfig, tiersOrModels, defaultProv
   const activeTiers = useAgenticTiers ? tiers.agentic : tiers;
 
   const decide = (tier, extra) => {
-    const spec = activeTiers[tier];
+    let spec = activeTiers[tier];
+    // HEAVY inheritance: when a tier is configured with the "__primary__"
+    // sentinel, resolve it to config.primaryModel at request time. If no
+    // primaryModel is configured, fall back to the tier's own
+    // fallbackProvider/Model. If neither exists, mark as "__unresolved__"
+    // and let the caller surface an error.
+    let resolvedFallback = null;
+    if (spec.provider === "__primary__" || spec.model === "__primary__") {
+      if (tiers.primaryModel && tiers.primaryModel.provider && tiers.primaryModel.model) {
+        spec = { ...spec, provider: tiers.primaryModel.provider, model: tiers.primaryModel.model };
+      } else if (spec.fallbackProvider && spec.fallbackModel) {
+        resolvedFallback = { provider: spec.fallbackProvider, model: spec.fallbackModel };
+        spec = { ...spec, provider: spec.fallbackProvider, model: spec.fallbackModel };
+      } else {
+        spec = { ...spec, provider: "__unresolved__", model: "__unresolved__" };
+      }
+    }
     return {
       model: spec.model,
       provider: spec.provider,
@@ -138,6 +154,7 @@ function classify(text, estimatedTokens, scoreConfig, tiersOrModels, defaultProv
       signals,
       agenticScore: agenticScore > 0 ? agenticScore : undefined,
       agenticProfile: useAgenticTiers || undefined,
+      fallbackSpec: resolvedFallback,
       ...extra,
     };
   };
@@ -199,6 +216,51 @@ function extractText(body) {
   return text;
 }
 
+// ─── LIGHT context-window guard ───
+
+// Estimate the total tokens in an OpenAI Chat Completions body (system +
+// user + assistant + tool messages). Returns object { total, system,
+// perMessage }. 1 token ~= 4 chars for English (under-estimate is fine for
+// safety; we round up).
+function estimateContextTokens(body) {
+  if (!body || !Array.isArray(body.messages)) return { total: 0, system: 0, perMessage: [] };
+  let total = 0, system = 0;
+  const perMessage = [];
+  for (const m of body.messages) {
+    const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
+    const toolCalls = Array.isArray(m.tool_calls)
+      ? JSON.stringify(m.tool_calls).length : 0;
+    const tok = Math.ceil((content.length + toolCalls) / 4);
+    total += tok;
+    if (m.role === "system") system += tok;
+    perMessage.push({ role: m.role, tokens: tok });
+  }
+  return { total, system, perMessage };
+}
+
+// Returns { allowed: boolean, reason, tokens, limit, model }.
+// `allowed=false` means LIGHT must REFUSE — we do NOT auto-escalate to
+// MEDIUM/HEAVY because the whole point of LIGHT is small isolated tasks.
+// If callers want a larger model, they should pick MEDIUM/HEAVY via the
+// explicit-model path.
+function checkLightContextWindow(body, tierSpec) {
+  const limit = tierSpec.effectiveContext || tierSpec.advertisedContext || 0;
+  const advertised = tierSpec.advertisedContext;
+  const { total, system } = estimateContextTokens(body);
+  if (limit > 0 && total > limit) {
+    let reason;
+    if (advertised && total > advertised) {
+      reason = `prompt exceeds model's hard context window (${total} > ${advertised} tokens)`;
+    } else if (system > limit * 0.8) {
+      reason = `system prompt alone (${system} tokens) is most of the LIGHT tier's effective budget (${limit} tokens). Pick MEDIUM or HEAVY via explicit model id, or shorten the system prompt.`;
+    } else {
+      reason = `prompt (${total} tokens) exceeds LIGHT tier's effective context budget (${limit} tokens). LIGHT is for small isolated tasks only — pick MEDIUM or HEAVY.`;
+    }
+    return { allowed: false, reason, tokens: total, system, limit, advertised, model: tierSpec.model };
+  }
+  return { allowed: true, tokens: total, system, limit, advertised, model: tierSpec.model };
+}
+
 // ─── Misc utilities ───
 
 function stripUnsafe(s) {
@@ -208,13 +270,23 @@ function stripUnsafe(s) {
 
 function resolveExplicitModel(modelId, defaultProvider, providers, tiersOrModels) {
   if (typeof modelId !== "string" || !modelId) return null;
+
+  // provider/model form: ONLY treat as provider-prefixed if the part BEFORE
+  // the first slash is a known provider in the providers map. This avoids
+  // misinterpreting namespace-prefixed ollama models like
+  // 'qcwind/qwen3-8b-instruct-Q4-K-M:latest' (where 'qcwind' is a
+  // namespace, not a provider) as a provider id.
   if (modelId.includes("/")) {
-    const [provider, ...rest] = modelId.split("/");
-    if (providers[provider] && rest.length) {
-      return { provider, model: rest.join("/"), stripThinking: false };
+    const slashIdx = modelId.indexOf("/");
+    const provider = modelId.slice(0, slashIdx);
+    const rest = modelId.slice(slashIdx + 1);
+    if (providers[provider] && rest) {
+      return { provider, model: rest, stripThinking: false };
     }
-    return null;
+    // Otherwise fall through to the bare-id lookup (probably matches a tier
+    // entry under defaultProvider).
   }
+
   // Always normalize via resolveTiers so spec.stripThinking is populated
   // (defaults to true for LIGHT, false for MEDIUM/HEAVY).
   const tiers = resolveTiers(tiersOrModels || {}, defaultProvider);
@@ -242,17 +314,42 @@ function providerKey(provider, env) {
 // full config object (loads `tiers` and `costs` from it). `tiers` is optional
 // — if not provided, we resolve it from `config.models`.
 function costMath(decision, estimatedTokens, config, tiers) {
-  const t = tiers || resolveTiers(config.models || {}, config.defaultProvider || "openai");
+  // If the caller didn't pre-attach primaryModel, walk back through config.
+  let t = tiers;
+  if (!t || !t.primaryModel) {
+    t = t ? { ...t, primaryModel: config.primaryModel || null }
+         : { ...resolveTiers(config.models || {}, config.defaultProvider || "openai"),
+             primaryModel: config.primaryModel || null };
+  }
   const { costs } = config;
   const costKey = `${decision.provider}/${decision.model}`;
   const cost = costs[costKey] || { input: 0, output: 0 };
-  const heavySpec = t.HEAVY;
+
+  // Resolve the HEAVY tier for baseline cost. If HEAVY is the "__primary__"
+  // sentinel, walk through primaryModel, then fallbackProvider/Model.
+  let heavySpec = t.HEAVY;
+  if (heavySpec.provider === "__primary__" || heavySpec.model === "__primary__") {
+    if (t.primaryModel && t.primaryModel.provider && t.primaryModel.model) {
+      heavySpec = { ...heavySpec, provider: t.primaryModel.provider, model: t.primaryModel.model };
+    } else if (heavySpec.fallbackProvider && heavySpec.fallbackModel) {
+      heavySpec = { ...heavySpec, provider: heavySpec.fallbackProvider, model: heavySpec.fallbackModel };
+    } else {
+      // No primary and no fallback — baseline is effectively "free" (which is
+      // wrong, but it means we can't compute a savings number). Surface as 0
+      // savings rather than crashing; caller decides how to log.
+      heavySpec = { provider: "__unresolved__", model: "__unresolved__" };
+    }
+  }
   const heavyCostKey = `${heavySpec.provider}/${heavySpec.model}`;
   const heavyInput = (costs[heavyCostKey] || cost).input;
 
   const promptCost = (estimatedTokens / 1_000_000) * cost.input;
   const baseCost = (estimatedTokens / 1_000_000) * heavyInput;
-  const savings = baseCost > 0 ? Math.max(0, (baseCost - promptCost) / baseCost) : 0;
+  // savings: 0 = no savings (same cost as baseline), 1 = 100% savings (free),
+  // 0.5 = half the cost. Negative is clamped to 0 (can't be cheaper than free).
+  const savings = baseCost > 0
+    ? Math.max(0, (baseCost - promptCost) / baseCost)
+    : (promptCost === 0 ? 0 : 1);
   return { promptCost, baseCost, savings };
 }
 
@@ -264,6 +361,8 @@ module.exports = {
   extractText,
   // utilities
   stripUnsafe, resolveExplicitModel, providerKey, costMath,
+  // LIGHT context-window guard
+  estimateContextTokens, checkLightContextWindow,
   // constants
   AGENTIC_THRESHOLD,
 };

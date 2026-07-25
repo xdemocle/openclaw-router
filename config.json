@@ -1,5 +1,5 @@
 {
-  "_comment_upstreamAllowlist": "TODO: SSRF policy placeholder. openclaw-router forwards requests to provider.baseUrl (hot-reloadable). Today the URL is trusted as-is (operators only — default config has only public endpoints + 127.0.0.1). Add an `upstreamAllowlist` array here with allowed hostname patterns (e.g. 'api.openai.com', '127.0.0.1', 'localhost', or CIDR ranges), then enforce in server.js loadConfig(). Operators who want to point at private IPs / metadata endpoints / arbitrary hosts would explicitly opt in.",
+  "_comment_upstreamAllowlist": "TODO: SSRF policy placeholder. openclaw-router forwards requests to provider.baseUrl (hot-reloadable). Today the URL is trusted as-is (operators only — default config has only public endpoints + 127.0.0.1). Add an `upstreamAllowlist` array here with allowed hostname patterns (e.g. 'api.openai.com', '127.0.0.1', 'localhost', or CIDR ranges), then enforce in server.js loadConfig(). Operators who want to point at private IPs / metadata endpoints / arbitrary hosts would explicitly opt in.\n\nNOTE on tier shape (2026-07-25):\n  - LIGHT  : local-only Ollama. Strict context-window guard refuses if system+user\n             tokens exceed models.LIGHT.effectiveContext (default 16K). Designed for\n             small, isolated cron tasks; OpenClaw's full system prompt (~20K+) will\n             be rejected — that's the point.\n  - MEDIUM : openrouter/auto. Hands off to OpenRouter's auto-router.\n  - HEAVY  : resolves to config.primaryModel at request time. If the primary\n             upstream returns 4xx/5xx (model not available, key revoked, etc.),\n             falls back to models.HEAVY.fallbackProvider/fallbackModel (defaults\n             to openai/gpt-5.1-mini).\n",
   "defaultProvider": "ollama",
   "providers": {
     "ollama": {
@@ -41,15 +41,19 @@
   "models": {
     "LIGHT": {
       "provider": "ollama",
-      "model": "llama3.1:8b"
+      "model": "qcwind/qwen3-8b-instruct-Q4-K-M:latest",
+      "effectiveContext": 16000,
+      "advertisedContext": 40960
     },
     "MEDIUM": {
-      "provider": "ollama",
-      "model": "qwen2.5-coder:32b"
+      "provider": "openrouter",
+      "model": "openrouter/auto"
     },
     "HEAVY": {
-      "provider": "openai",
-      "model": "gpt-5.1"
+      "provider": "__primary__",
+      "model": "__primary__",
+      "fallbackProvider": "openai",
+      "fallbackModel": "gpt-5.1-mini"
     }
   },
   "costs": {
@@ -884,5 +888,9 @@
       "reasoningKeywordMin": 2,
       "largeContextTokens": 50000
     }
+  },
+  "primaryModel": {
+    "provider": "openai",
+    "model": "gpt-5.1"
   }
 }

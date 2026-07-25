@@ -62,16 +62,36 @@ function loadConfig() {
   // Same shape as before: a tier value is either a bare string (model id on default
   // provider) or { provider, model, stripThinking? }.
   cfg.tiers = {};
+  // primaryModel: HEAVY inheritance. If config.primaryModel is set, the
+  // HEAVY tier's "__primary__" sentinel resolves to it at request time.
+  // If unset, HEAVY.fallbackProvider/Model kicks in.
+  if (cfg.primaryModel && cfg.primaryModel.provider && cfg.primaryModel.model) {
+    if (!cfg.providers[cfg.primaryModel.provider]) {
+      throw new Error(`primaryModel references unknown provider "${cfg.primaryModel.provider}"`);
+    }
+  }
   for (const tier of ["LIGHT", "MEDIUM", "HEAVY"]) {
     const v = cfg.models[tier];
     const spec = typeof v === "string"
       ? { provider: cfg.defaultProvider, model: v }
       : { provider: v.provider || cfg.defaultProvider, model: v.model, stripThinking: v.stripThinking };
     if (spec.stripThinking === undefined) spec.stripThinking = tier === "LIGHT";
-    if (!cfg.providers[spec.provider]) {
+    // Allow the "__primary__" sentinel — resolved at request time against
+    // cfg.primaryModel inside scorer.classify(). If primaryModel isn't set,
+    // HEAVY.fallbackProvider/Model takes over (also validated below).
+    if (spec.provider !== "__primary__" && spec.provider !== "__unresolved__" && !cfg.providers[spec.provider]) {
       throw new Error(`Tier ${tier} references unknown provider "${spec.provider}"`);
     }
     cfg.tiers[tier] = spec;
+  }
+  cfg.tiers.primaryModel = cfg.primaryModel || null;
+
+  // Validate primaryModel up-front if set, so the router refuses to start
+  // with a misconfigured primary rather than 503-ing every HEAVY request.
+  if (cfg.tiers.primaryModel && cfg.tiers.primaryModel.provider && cfg.tiers.primaryModel.model) {
+    if (!cfg.providers[cfg.tiers.primaryModel.provider]) {
+      throw new Error(`primaryModel references unknown provider "${cfg.tiers.primaryModel.provider}"`);
+    }
   }
 
   return cfg;
@@ -176,6 +196,34 @@ function proxyUpstream(req, res, body, decision, onComplete) {
 
   const transport = parsed.protocol === "https:" ? https : http;
   const upstreamReq = transport.request(options, (upstreamRes) => {
+    // ─── HEAVY fallback ───
+    // If the primary upstream returned 4xx/5xx and we have a configured
+    // fallback spec (because the tier was "__primary__" with no primaryModel),
+    // retry on the fallback. We do NOT retry on 2xx/3xx — those are success.
+    // We also do NOT retry on 429 (rate-limit) — that's a real signal, not a
+    // config problem; retrying would compound the rate-limit problem.
+    const retryable =
+      (upstreamRes.statusCode >= 400 && upstreamRes.statusCode < 500 && upstreamRes.statusCode !== 404 && upstreamRes.statusCode !== 429)
+      || upstreamRes.statusCode >= 500;
+    if (retryable && decision.fallbackSpec && decision.fallbackSpec.provider && decision.fallbackSpec.model) {
+      // Drain the body of the failed response (don't leave the socket dangling),
+      // then retry on the fallback. We rebuild the body buffer so we can resend.
+      const failChunks = [];
+      upstreamRes.on("data", (c) => failChunks.push(c));
+      upstreamRes.on("end", () => {
+        const failBody = Buffer.concat(failChunks).toString();
+        console.error(
+          `[router] HEAVY primary failed (${upstreamRes.statusCode}), ` +
+          `falling back to ${decision.fallbackSpec.provider}/${decision.fallbackSpec.model}: ` +
+          stripUnsafe(failBody).slice(0, 200)
+        );
+        // Build a synthetic decision pointing at the fallback.
+        const fbDecision = { ...decision, ...decision.fallbackSpec, fallbackSpec: null };
+        proxyUpstream(req, res, body, fbDecision, onComplete);
+      });
+      return;
+    }
+
     // Relay status + safe subset of headers
     const safeHeaders = {};
     const passthrough = ["content-type", "cache-control", "x-request-id"];
@@ -330,6 +378,31 @@ const server = http.createServer((req, res) => {
       const text = extractText(body);
       const estimatedTokens = Math.ceil(text.length / 4);
       const decision = classify(text, estimatedTokens);
+
+      // ─── LIGHT context-window guard ───
+      // LIGHT is for small isolated cron tasks only. If the prompt (system +
+      // user + tool schemas) exceeds the LIGHT tier's effectiveContext, REFUSE
+      // — do NOT silently escalate to MEDIUM/HEAVY. That would defeat the
+      // whole point of routing cron work to a cheap local model.
+      if (decision.tier === "LIGHT") {
+        const lightSpec = config.tiers.LIGHT;
+        const guard = scorer.checkLightContextWindow(body, lightSpec);
+        if (!guard.allowed) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: "light_context_exceeded",
+            message: guard.reason,
+            tier: "LIGHT",
+            tokens: guard.tokens,
+            system_tokens: guard.system,
+            effective_context: guard.limit,
+            advertised_context: guard.advertised,
+            model: guard.model,
+            hint: "LIGHT is for small isolated cron tasks. Use an explicit model id like 'openai/gpt-5.1' or 'openrouter/auto' for general requests."
+          }));
+          return;
+        }
+      }
 
       // Cost lookup uses provider-prefixed key to match config.costs layout.
       // Fallback for unknown models: treat as 0 — by-design free rather than

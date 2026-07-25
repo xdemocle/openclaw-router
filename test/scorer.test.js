@@ -135,7 +135,7 @@ describe("classify", () => {
   test("medium-complexity prompt routes to MEDIUM", () => {
     const d = scorer.classify("write a function to compute fibonacci", 50, cfg.scoring, cfg.models, cfg.defaultProvider);
     assert.equal(d.tier, "MEDIUM");
-    assert.equal(d.provider, "ollama");
+    assert.equal(d.provider, "openrouter");
   });
   test("decision includes score, signals, and confidence", () => {
     const d = scorer.classify("hello", 1, cfg.scoring, cfg.models, cfg.defaultProvider);
@@ -146,8 +146,8 @@ describe("classify", () => {
   });
   test("accepts resolved tier map (skips resolution)", () => {
     const resolved = {
-      LIGHT: { provider: "ollama", model: "llama3.1:8b", stripThinking: true },
-      MEDIUM: { provider: "ollama", model: "qwen2.5-coder:32b", stripThinking: false },
+      LIGHT: { provider: "ollama", model: "tiny", stripThinking: true },
+      MEDIUM: { provider: "openrouter", model: "openrouter/auto", stripThinking: true },
       HEAVY: { provider: "openai", model: "gpt-5.1", stripThinking: false },
     };
     const d = scorer.classify("hello thanks", 1, cfg.scoring, resolved);
@@ -172,8 +172,11 @@ describe("resolveExplicitModel", () => {
     assert.deepEqual(r, { provider: "openai", model: "gpt-5.1", stripThinking: false });
   });
   test("bare id matches a tier entry under default provider", () => {
-    const r = scorer.resolveExplicitModel("llama3.1:8b", cfg.defaultProvider, cfg.providers, cfg.models);
-    assert.deepEqual(r, { provider: "ollama", model: "llama3.1:8b", stripThinking: true });
+    const id = cfg.models.LIGHT.model;
+    const r = scorer.resolveExplicitModel(id, cfg.defaultProvider, cfg.providers, cfg.models);
+    assert.equal(r.provider, "ollama");
+    assert.equal(r.model, id);
+    assert.equal(r.stripThinking, true);
   });
   test("bare id that doesn't match anything returns null", () => {
     const r = scorer.resolveExplicitModel("not-a-known-model", cfg.defaultProvider, cfg.providers, cfg.models);
@@ -199,7 +202,7 @@ describe("costMath", () => {
     assert.equal(m.savings, 0); // same as baseline
   });
   test("local Ollama = free, savings = 100%", () => {
-    const m = scorer.costMath({ provider: "ollama", model: "llama3.1:8b" }, 1_000_000, cfg);
+    const m = scorer.costMath({ provider: "ollama", model: cfg.models.LIGHT.model }, 1_000_000, cfg);
     assert.equal(m.promptCost, 0);
     assert.equal(m.savings, 1);
   });
@@ -240,9 +243,9 @@ describe("resolveTiers", () => {
   test("resolves raw models block", () => {
     const t = scorer.resolveTiers(cfg.models, cfg.defaultProvider);
     assert.equal(t.LIGHT.provider, "ollama");
-    assert.equal(t.LIGHT.model, "llama3.1:8b");
+    assert.equal(t.LIGHT.model, "qcwind/qwen3-8b-instruct-Q4-K-M:latest");
     assert.equal(t.LIGHT.stripThinking, true);
-    assert.equal(t.HEAVY.provider, "openai");
+    assert.equal(t.HEAVY.provider, "__primary__");  // sentinel — resolved at request time
     assert.equal(t.HEAVY.stripThinking, false);
   });
   test("handles bare string model ids (uses default provider)", () => {
