@@ -11,35 +11,109 @@
 # Preserves .bak files (operator can roll back manually).
 set -euo pipefail
 
+
+# ─── Flags ──────────────────────────────────────────────────────────────────
+# --dry-run  : read-only simulation. Print what would happen but make NO
+#              changes to disk, NO sudo, NO rm, NO config writes.
+#              Returns 0 if every simulated step would succeed, 1 otherwise.
+# -h, --help : print usage and exit 0.
+DRY_RUN=0
+SHOW_HELP=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) SHOW_HELP=1 ;;
+    *) echo "Unknown flag: $arg"; exit 2 ;;
+  esac
+done
+
+if [ "$SHOW_HELP" = "1" ]; then
+  cat <<'USAGE'
+openclaw-router uninstaller
+
+Usage:
+  bash scripts/uninstall.sh [options]
+
+Options:
+  --dry-run   Simulate every step (systemd stop, rm, config edits). Make
+              NO changes to disk. Exit 0 if all simulated steps would
+              succeed.
+  -h, --help  Show this help and exit.
+
+Examples:
+  # Show what uninstall.sh would do, without touching anything:
+  bash scripts/uninstall.sh --dry-run
+
+  # Uninstall for real (removes systemd unit, env file, router dir,
+  # AND edits configs/*.json5 or openclaw.json):
+  bash scripts/uninstall.sh
+
+USAGE
+  exit 0
+fi
+
+# Default HOME if unset (e.g. when run via sudo without -E, or in a stripped env).
+: "${HOME:=/root}"
+
+# noop(): DRY_RUN gate. Prints what would happen, does nothing destructive.
+noop() {
+  echo "  [dry-run] would: $*"
+}
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo "Removing openclaw-router (DRY RUN — no changes will be made)..."
+else
+  echo "Removing openclaw-router..."
+fi
 SERVICE_NAME="openclaw-router"
 ROUTER_DIR="$HOME/.openclaw/workspace/skills/router"
 ENV_FILE="/etc/openclaw-router.env"
 
-echo "Removing openclaw-router..."
 
 # ─── 1. Stop + disable + remove systemd unit ───────────────────────────────
 if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-  sudo systemctl stop "$SERVICE_NAME" || true
+  if [ "$DRY_RUN" = "1" ]; then
+    noop "systemctl stop $SERVICE_NAME"
+  else
+    sudo systemctl stop "$SERVICE_NAME" || true
+  fi
   echo "  ✓ Service stopped"
 fi
 if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
-  sudo systemctl disable "$SERVICE_NAME" || true
+  if [ "$DRY_RUN" = "1" ]; then
+    noop "systemctl disable $SERVICE_NAME"
+  else
+    sudo systemctl disable "$SERVICE_NAME" || true
+  fi
 fi
 if [ -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
-  sudo rm "/etc/systemd/system/$SERVICE_NAME.service"
-  sudo systemctl daemon-reload || true
+  if [ "$DRY_RUN" = "1" ]; then
+    noop "rm /etc/systemd/system/$SERVICE_NAME.service"
+    noop "systemctl daemon-reload"
+  else
+    sudo rm "/etc/systemd/system/$SERVICE_NAME.service"
+    sudo systemctl daemon-reload || true
+  fi
   echo "  ✓ Systemd unit removed"
 fi
 
 # ─── 2. Remove env file (chmod 0600 root-only) ────────────────────────────
 if [ -f "$ENV_FILE" ]; then
-  sudo rm "$ENV_FILE"
+  if [ "$DRY_RUN" = "1" ]; then
+    noop "rm $ENV_FILE"
+  else
+    sudo rm "$ENV_FILE"
+  fi
   echo "  ✓ Env file removed"
 fi
 
 # ─── 3. Remove router files ───────────────────────────────────────────────
 if [ -d "$ROUTER_DIR" ]; then
-  rm -rf "$ROUTER_DIR"
+  if [ "$DRY_RUN" = "1" ]; then
+    noop "rm -rf $ROUTER_DIR"
+  else
+    rm -rf "$ROUTER_DIR"
+  fi
   echo "  ✓ Router files removed from $ROUTER_DIR"
 fi
 
@@ -85,10 +159,11 @@ echo "  ✓ Detected OpenClaw mode: $OPENCLAW_MODE"
 #
 if [ "$OPENCLAW_MODE" = "include-router" ]; then
   if [ -f "$MODELS_FILE" ]; then
-    python3 - "$MODELS_FILE" <<'PYEOF'
+    python3 - "$MODELS_FILE" "dry_run=$DRY_RUN" <<'PYEOF'
 import json, re, sys
 from pathlib import Path
 p = sys.argv[1]
+DRY_RUN = len(sys.argv) > 2 and sys.argv[2] == "dry_run=1"
 text = Path(p).read_text()
 # Surgical: remove `"openclaw-router": {...},` from the providers map.
 m = re.search(r'^\s*"providers"\s*:\s*\{', text, re.M)
@@ -140,18 +215,22 @@ if trailing_end < len(block) and block[trailing_end] == "\n":
     trailing_end += 1
 new_block = block[:leading_start] + block[trailing_end:]
 new_text = text[:start] + new_block + text[end - 1:]
-Path(p).write_text(new_text)
-print(f"  ✓ Removed 'openclaw-router' provider from {Path(p).name}")
+if DRY_RUN:
+    print(f"  [dry-run] would remove 'openclaw-router' entry from {Path(p).name}")
+else:
+    Path(p).write_text(new_text)
+    print(f"  ✓ Removed 'openclaw-router' provider from {Path(p).name}")
 PYEOF
   fi
 
   if [ -f "$AGENTS_FILE" ]; then
     # Surgical: remove `"openclaw-router/auto": {...},` from agents.defaults.models.
     # Pure text — agents.json5 may have unquoted JSON5 keys.
-    python3 - "$AGENTS_FILE" <<'PYEOF'
+    python3 - "$AGENTS_FILE" "dry_run=$DRY_RUN" <<'PYEOF'
 import re, sys
 from pathlib import Path
 p = sys.argv[1]
+DRY_RUN = len(sys.argv) > 2 and sys.argv[2] == "dry_run=1"
 text = Path(p).read_text()
 m = re.search(r'"models"\s*:\s*\{', text)
 if not m:
@@ -190,17 +269,21 @@ if te < len(block) and block[te] == "\n":
     te += 1
 new_block = block[:ls] + block[te:]
 new_text = text[:start] + new_block + text[end - 1:]
-Path(p).write_text(new_text)
-print(f"  ✓ Removed 'openclaw-router/auto' from {Path(p).name}")
+if DRY_RUN:
+    print(f"  [dry-run] would remove 'openclaw-router/auto' entry from {Path(p).name}")
+else:
+    Path(p).write_text(new_text)
+    print(f"  ✓ Removed 'openclaw-router/auto' from {Path(p).name}")
 PYEOF
   fi
 else
   # Legacy flat — single-file edit.
   if [ -f "$MODELS_FILE" ]; then
-    python3 - "$MODELS_FILE" <<'PYEOF'
+    python3 - "$MODELS_FILE" "dry_run=$DRY_RUN" <<'PYEOF'
 import json, sys
 from pathlib import Path
 p = sys.argv[1]
+DRY_RUN = len(sys.argv) > 2 and sys.argv[2] == "dry_run=1"
 cfg = json.loads(Path(p).read_text())
 changed = False
 providers = cfg.get("models", {}).get("providers", {})
@@ -216,7 +299,10 @@ if "openclaw-router/auto" in allowlist:
     changed = True
     print(f"  ✓ Removed 'openclaw-router/auto' from {Path(p).name}")
 if changed:
-    Path(p).write_text(json.dumps(cfg, indent=2) + "\n")
+    if DRY_RUN:
+        print(f"  [dry-run] would write cleaned {Path(p).name}")
+    else:
+        Path(p).write_text(json.dumps(cfg, indent=2) + "\n")
 else:
     print(f"  ✓ {Path(p).name} already clean")
 PYEOF
