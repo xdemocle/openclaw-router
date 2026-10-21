@@ -316,6 +316,60 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // OpenAI model discovery endpoint. The OpenAI SDK (and OpenClaw's gateway)
+  // call GET /v1/models to enumerate available models before chat completions.
+  // OpenClaw registers this provider as `openclaw-router/auto` in its allowlist,
+  // then asks the gateway for the bare model id `auto` — so the synthesized
+  // discovery response MUST include a literal `id: "auto"` entry (alongside
+  // the resolved tier entries for completeness). Without the bare `auto`,
+  // the gateway surfaces "model not found" even though the chat completion
+  // itself was wired up correctly. REGRESSION: caught 2026-10-21.
+  if (req.method === "GET" && (req.url === "/v1/models" || req.url.startsWith("/v1/models?"))) {
+    const seen = new Set();
+    const entries = [];
+    // Always advertise the bare model id that OpenClaw registers in its
+    // models.json5 providers block (the provider entry declares `id: "auto"`
+    // and OpenClaw routes requests for `<provider>/<id>` = `openclaw-router/auto`).
+    entries.push({ id: "auto", object: "model", created: 0, owned_by: "system" });
+    seen.add("auto");
+    for (const tier of ["LIGHT", "MEDIUM", "HEAVY"]) {
+      const t = config.tiers[tier] || {};
+      // Skip the __primary__ sentinel in discovery — exposing it as a literal
+      // model id would be misleading since it never resolves to a real upstream.
+      if (t.provider === "__primary__" || t.model === "__primary__") continue;
+      const id = `${t.provider}/${t.model}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({ id, object: "model", created: 0, owned_by: t.provider });
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ object: "list", data: entries }));
+    return;
+  }
+
+  // Per-model lookup (OpenAI SDK calls GET /v1/models/{id} to validate a
+  // specific model exists). Accept:
+  //   - bare "auto"                         (registered id in models.json5)
+  //   - "openclaw-router/auto"              (provider-prefixed, what OpenClaw
+  //                                           actually requests before sending
+  //                                           a chat completion — without this
+  //                                           200, the gateway raises "model not
+  //                                           found" even though /v1/models list
+  //                                           already showed 'auto')
+  if (req.method === "GET" && (req.url === "/v1/models/auto" ||
+      req.url === "/v1/models/openclaw-router/auto" ||
+      req.url.startsWith("/v1/models/auto?") ||
+      req.url.startsWith("/v1/models/openclaw-router/auto?"))) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "auto",
+      object: "model",
+      created: 0,
+      owned_by: "system",
+    }));
+    return;
+  }
+
   // Only OpenAI Chat Completions. /v1/messages (legacy Anthropic shape) is
   // explicitly NOT supported — silent acceptance was worse than a clear 410.
   const isChatCompletions = req.method === "POST" && (
@@ -343,6 +397,27 @@ const server = http.createServer((req, res) => {
   if (declaredLength > MAX_BODY_BYTES) {
     res.writeHead(413, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "payload too large", limit: MAX_BODY_BYTES }));
+    return;
+  }
+
+  // OpenAI model discovery endpoint. The OpenAI SDK (and OpenClaw's gateway)
+  // call GET /v1/models to enumerate available models before chat completions.
+  // We answer with a single synthesized `auto` entry that mirrors what the
+  // provider entry declares in models.json5. Without this, model discovery
+  // would 404 and the gateway would surface "model not found" even though
+  // chat completions work fine.
+  if (req.method === "GET" && (req.url === "/v1/models" || req.url.startsWith("/v1/models?"))) {
+    const seen = new Set();
+    const entries = [];
+    for (const tier of ["LIGHT", "MEDIUM", "HEAVY"]) {
+      const t = config.tiers[tier] || {};
+      const id = `${t.provider}/${t.model}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({ id, object: "model", created: 0, owned_by: t.provider });
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ object: "list", data: entries }));
     return;
   }
 

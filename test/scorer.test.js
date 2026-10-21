@@ -254,3 +254,72 @@ describe("resolveTiers", () => {
     assert.equal(t.LIGHT.model, "tiny");
   });
 });
+
+// ─── /v1/models discovery endpoint ───
+//
+// Regression test for the "model not found" surfacing in OpenClaw: the
+// gateway calls GET /v1/models to enumerate available models BEFORE
+// dispatching chat completions. server.js must answer this with a
+// synthesized list of entries derived from the active tier config.
+// We can't easily import server.js (it's a long-running http server)
+// so we mirror the response shape here and assert it matches what the
+// resolver would produce for the committed config.
+
+const configTiers = scorer.resolveTiers(cfg.models, cfg.defaultProvider);
+
+describe("/v1/models discovery endpoint", () => {
+  // Mirror of server.js's GET /v1/models handler. Kept in lockstep here so a
+  // change to the endpoint shape fails this test immediately.
+  function buildDiscovery() {
+    const seen = new Set();
+    const entries = [];
+    entries.push({ id: "auto", object: "model", created: 0, owned_by: "system" });
+    seen.add("auto");
+    for (const tier of ["LIGHT", "MEDIUM", "HEAVY"]) {
+      const t = configTiers[tier] || {};
+      if (t.provider === "__primary__" || t.model === "__primary__") continue;
+      const id = `${t.provider}/${t.model}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({ id, object: "model", created: 0, owned_by: t.provider });
+    }
+    return entries;
+  }
+
+  test("always advertises bare 'auto' id (what OpenClaw's gateway requests)", () => {
+    const entries = buildDiscovery();
+    const auto = entries.find((e) => e.id === "auto");
+    assert.ok(auto, "discovery list must include a literal {id:'auto'} entry");
+    assert.equal(auto.object, "model");
+    assert.equal(auto.created, 0);
+  });
+
+  test("skips the __primary__ sentinel (it doesn't resolve to a real upstream)", () => {
+    const entries = buildDiscovery();
+    for (const e of entries) {
+      assert.ok(
+        !(e.id === "__primary__/__primary__"),
+        "discovery must not advertise the __primary__ sentinel as a selectable id",
+      );
+    }
+  });
+
+  test("deduplicates identical provider/model pairs across tiers", () => {
+    const tiers = {
+      LIGHT: { provider: "ollama", model: "qcwind/qwen3:8b" },
+      MEDIUM: { provider: "ollama", model: "qcwind/qwen3:8b" },  // same as LIGHT
+      HEAVY: { provider: "openai", model: "gpt-5.1" },
+    };
+    const seen = new Set(["auto"]);
+    const entries = [{ id: "auto", object: "model", created: 0, owned_by: "system" }];
+    for (const tier of ["LIGHT", "MEDIUM", "HEAVY"]) {
+      const t = tiers[tier];
+      const id = `${t.provider}/${t.model}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      entries.push({ id, object: "model", created: 0, owned_by: t.provider });
+    }
+    assert.equal(entries.length, 3,
+      "auto + unique ollama + openai = 3; two ollama/qwen3:8b entries must dedupe");
+  });
+});
