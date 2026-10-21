@@ -55,6 +55,13 @@ fi
 # Default HOME if unset (e.g. when run via sudo without -E, or in a stripped env).
 : "${HOME:=/root}"
 
+# OpenClaw state dir. Respects OPENCLAW_STATE_DIR so this script works against
+# a --profile <name> instance (state at ~/.openclaw-<name>, NOT nested under
+# $HOME/.openclaw) exactly like the `openclaw` CLI itself does. Falls back to
+# the default-profile layout ($HOME/.openclaw) when unset.
+# See: https://docs.openclaw.ai/gateway/multiple-gateways
+OPENCLAW_HOME="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+
 # noop(): DRY_RUN gate. Prints what would happen, does nothing destructive.
 noop() {
   echo "  [dry-run] would: $*"
@@ -66,7 +73,7 @@ else
   echo "Removing openclaw-router..."
 fi
 SERVICE_NAME="openclaw-router"
-ROUTER_DIR="$HOME/.openclaw/workspace/skills/router"
+ROUTER_DIR="$OPENCLAW_HOME/workspace/skills/router"
 ENV_FILE="/etc/openclaw-router.env"
 
 
@@ -118,7 +125,7 @@ if [ -d "$ROUTER_DIR" ]; then
 fi
 
 # ─── 4. Detect OpenClaw config layout ──────────────────────────────────────
-OPENCLAW_JSON="$HOME/.openclaw/openclaw.json"
+OPENCLAW_JSON="$OPENCLAW_HOME/openclaw.json"
 OPENCLAW_MODE="flat"
 if [ -f "$OPENCLAW_JSON" ]; then
   OPENCLAW_MODE=$(python3 - "$OPENCLAW_JSON" <<'PYEOF' || echo "flat"
@@ -143,8 +150,8 @@ fi
 
 case "$OPENCLAW_MODE" in
   include-router)
-    MODELS_FILE="$HOME/.openclaw/configs/models.json5"
-    AGENTS_FILE="$HOME/.openclaw/configs/agents.json5"
+    MODELS_FILE="$OPENCLAW_HOME/configs/models.json5"
+    AGENTS_FILE="$OPENCLAW_HOME/configs/agents.json5"
     ;;
   flat)
     MODELS_FILE="$OPENCLAW_JSON"

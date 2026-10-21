@@ -80,8 +80,15 @@ noop() {
 # Default HOME if unset (e.g. when run via sudo without -E, or in a stripped env).
 : "${HOME:=/root}"
 
+# OpenClaw state dir. Respects OPENCLAW_STATE_DIR so this script works against
+# a --profile <name> instance (state at ~/.openclaw-<name>, NOT nested under
+# $HOME/.openclaw) exactly like the `openclaw` CLI itself does. Falls back to
+# the default-profile layout ($HOME/.openclaw) when unset.
+# See: https://docs.openclaw.ai/gateway/multiple-gateways
+OPENCLAW_HOME="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-ROUTER_DIR="$HOME/.openclaw/workspace/skills/router"
+ROUTER_DIR="$OPENCLAW_HOME/workspace/skills/router"
 SERVICE_NAME="openclaw-router"
 PORT=8402
 
@@ -119,41 +126,80 @@ fi
 
 # ─── 2. Detect OpenClaw config layout ──────────────────────────────────────
 #
-# mode=include-router: most top-level values are { "$include": "..." }
-#                      (srv3+). We register via configs/models.json5 +
-#                      configs/agents.json5. openclaw.json itself is
-#                      NEVER modified.
-# mode=flat:          openclaw.json holds the full config (legacy).
+# mode=include-router: models + agents top-level keys are BOTH pure
+#                      { "$include": "..." } refs (srv3-era layout). We
+#                      register via configs/models.json5 + configs/agents.json5.
+#                      openclaw.json itself is NEVER modified.
+# mode=flat:          models + agents are inline AND no configs/ dir exists
+#                      on disk (clean legacy/dev-profile layout, e.g. a
+#                      --profile test instance). We edit openclaw.json
+#                      directly via JSON round-trip.
+# mode=ambiguous:     anything else — e.g. configs/models.json5 exists on
+#                      disk but openclaw.json's models/agents keys are NOT
+#                      pure $include (observed on srv3 after an OpenClaw
+#                      auto-update consolidated top-level config without
+#                      removing the old configs/*.json5 files). We do NOT
+#                      guess here: writing to the wrong target either
+#                      silently no-ops or corrupts a file that's no longer
+#                      the real source of truth. Abort loudly instead.
 #
-OPENCLAW_JSON="$HOME/.openclaw/openclaw.json"
+OPENCLAW_JSON="$OPENCLAW_HOME/openclaw.json"
 OPENCLAW_MODE="flat"
 if [ -f "$OPENCLAW_JSON" ]; then
-  # `python3 -c` on the JSON: majority of top-level values are
-  # { "$include": "..." } → include-router. We require ≥80% to avoid
-  # mis-detecting files that just happen to have a few includes.
-  OPENCLAW_MODE=$(python3 - "$OPENCLAW_JSON" <<'PYEOF' || echo "flat"
-import json, sys
+  OPENCLAW_MODE=$(python3 - "$OPENCLAW_JSON" "$OPENCLAW_HOME" <<'PYEOF' || echo "ambiguous"
+import json, os, sys
+json_path, openclaw_home = sys.argv[1], sys.argv[2]
 try:
-    with open(sys.argv[1]) as f:
+    with open(json_path) as f:
         cfg = json.load(f)
-    if isinstance(cfg, dict) and cfg:
-        total = len(cfg)
-        inc = sum(
-            1 for v in cfg.values()
-            if isinstance(v, dict) and set(v.keys()) == {"$include"}
-        )
-        print("include-router" if (inc / total) >= 0.8 else "flat")
-    else:
+    if not isinstance(cfg, dict) or not cfg:
         print("flat")
+        sys.exit(0)
+
+    def is_pure_include(key):
+        v = cfg.get(key)
+        return isinstance(v, dict) and set(v.keys()) == {"$include"}
+
+    models_include = is_pure_include("models")
+    agents_include = is_pure_include("agents")
+    configs_dir_exists = os.path.isdir(os.path.join(openclaw_home, "configs"))
+    legacy_models_file = os.path.isfile(os.path.join(openclaw_home, "configs", "models.json5"))
+    legacy_agents_file = os.path.isfile(os.path.join(openclaw_home, "configs", "agents.json5"))
+
+    if models_include and agents_include:
+        print("include-router")
+    elif not models_include and not agents_include and not configs_dir_exists:
+        # Clean flat layout: nothing on disk hints at a split-config past.
+        print("flat")
+    elif not models_include and not agents_include and (legacy_models_file or legacy_agents_file):
+        # Drifted: openclaw.json has models/agents inlined, but
+        # configs/*.json5 still exist on disk. We don't know which one
+        # OpenClaw actually treats as authoritative post-update. Abort.
+        print("ambiguous")
+    else:
+        # Partial $include (one of models/agents is $include, the other
+        # isn't) — also don't guess.
+        print("ambiguous")
 except Exception:
-    print("flat")
+    print("ambiguous")
 PYEOF
 )
 fi
 
+if [ "$OPENCLAW_MODE" = "ambiguous" ]; then
+  echo "  ✗ Could not reliably determine OpenClaw config layout for $OPENCLAW_JSON"
+  echo "    This usually means configs/models.json5 or configs/agents.json5 exist"
+  echo "    on disk, but openclaw.json's models/agents keys are no longer plain"
+  echo "    { \"\$include\": \"...\" } refs (seen after some OpenClaw auto-updates"
+  echo "    consolidate config without removing the old split files)."
+  echo "    Refusing to guess which file is authoritative — register the"
+  echo "    provider by hand, or re-run after confirming the actual layout."
+  exit 1
+fi
+
 case "$OPENCLAW_MODE" in
   include-router)
-    CONFIGS_DIR="$HOME/.openclaw/configs"
+    CONFIGS_DIR="$OPENCLAW_HOME/configs"
     MODELS_FILE="$CONFIGS_DIR/models.json5"
     AGENTS_FILE="$CONFIGS_DIR/agents.json5"
     ;;
@@ -179,10 +225,10 @@ API_KEY=""
 if [ -n "${OPENAI_API_KEY:-}" ]; then
   API_KEY="$OPENAI_API_KEY"
   echo "  ✓ Using OPENAI_API_KEY from environment"
-elif [ -f "$HOME/.openclaw/secrets.jsonc" ]; then
+elif [ -f "$OPENCLAW_HOME/secrets.jsonc" ]; then
   # secrets.jsonc is JSON5; strip // comments before parsing. The apiKey value
   # under models.providers.openai is the raw sk-... string.
-  API_KEY=$(python3 - "$HOME/.openclaw/secrets.jsonc" <<'PYEOF' 2>/dev/null || true
+  API_KEY=$(python3 - "$OPENCLAW_HOME/secrets.jsonc" <<'PYEOF' 2>/dev/null || true
 import json, re, sys
 try:
     text = open(sys.argv[1]).read()
@@ -229,10 +275,10 @@ PYEOF
   if [ -n "$API_KEY" ]; then
     echo "  ✓ Detected OpenAI key from secrets.jsonc"
   fi
-elif [ -f "$HOME/.openclaw/agents/main/agent/auth-profiles.json" ]; then
+elif [ -f "$OPENCLAW_HOME/agents/main/agent/auth-profiles.json" ]; then
   # Legacy: the very first "key": "..." field of auth-profiles.json. Note: this
   # file does NOT exist on srv3+ layouts (where auth moved to secrets.jsonc).
-  API_KEY=$(grep -o '"key":[[:space:]]*"[^"]*"' "$HOME/.openclaw/agents/main/agent/auth-profiles.json" 2>/dev/null | head -1 | sed -E 's/.*"([^"]*)"$/\1/' || true)
+  API_KEY=$(grep -o '"key":[[:space:]]*"[^"]*"' "$OPENCLAW_HOME/agents/main/agent/auth-profiles.json" 2>/dev/null | head -1 | sed -E 's/.*"([^"]*)"$/\1/' || true)
   if [ -n "$API_KEY" ]; then
     echo "  ✓ Detected API key from auth-profiles.json (legacy)"
   fi
@@ -486,13 +532,19 @@ cfg = json.loads(Path(p).read_text())
 providers = cfg.setdefault("models", {}).setdefault("providers", {})
 if "openclaw-router" not in providers:
     providers["openclaw-router"] = json.loads(provider_json_str)
-    print(f"  ✓ Registered 'openclaw-router' provider in {Path(p).name}")
+    if DRY_RUN:
+        print(f"  [dry-run] would register 'openclaw-router' provider in {Path(p).name}")
+    else:
+        print(f"  ✓ Registered 'openclaw-router' provider in {Path(p).name}")
 else:
     print(f"  ✓ Provider already registered in {Path(p).name}")
 allowlist = cfg.get("agents", {}).get("defaults", {}).get("models")
 if isinstance(allowlist, dict) and "openclaw-router/auto" not in allowlist:
     allowlist["openclaw-router/auto"] = {}
-    print(f"  ✓ Added 'openclaw-router/auto' to {Path(p).name} model allowlist")
+    if DRY_RUN:
+        print(f"  [dry-run] would add 'openclaw-router/auto' to {Path(p).name} model allowlist")
+    else:
+        print(f"  ✓ Added 'openclaw-router/auto' to {Path(p).name} model allowlist")
 if DRY_RUN:
     print(f"  [dry-run] would write modified {Path(p).name}")
 else:
