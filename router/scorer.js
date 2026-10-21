@@ -14,7 +14,13 @@ function scoreTokenCount(tokens, thresholds) {
 }
 
 function scoreKeywords(text, keywords, threshLow, threshHigh, scoreLow, scoreHigh) {
-  const matches = keywords.filter(kw => text.includes(kw.toLowerCase()));
+  // `keywords` may be undefined when config.json omits a particular category
+  // (e.g. a minimal/profiled install that declares only simpleKeywords +
+  // complexKeywords). Treat missing arrays as empty — the scorer returns
+  // score:0 for that dimension, which is a safe no-op signal rather than a
+  // hard crash. Same defensive pattern as the upstream's scoring config.
+  const list = Array.isArray(keywords) ? keywords : [];
+  const matches = list.filter(kw => text.includes(kw.toLowerCase()));
   if (matches.length >= threshHigh) return { score: scoreHigh, signal: matches.slice(0, 3).join(",") };
   if (matches.length >= threshLow) return { score: scoreLow, signal: matches.slice(0, 2).join(",") };
   return { score: 0, signal: null };
@@ -23,7 +29,11 @@ function scoreKeywords(text, keywords, threshLow, threshHigh, scoreLow, scoreHig
 function scorePatterns(text, patterns) {
   // Patterns may be RegExp or strings (when called from server.js after
   // loadConfig compiled them; or when called from tests with raw config.json).
-  const hits = patterns.filter(p => {
+  // `patterns` may be undefined when config.json omits the corresponding array
+  // (e.g. minimal/profiled install with only simpleKeywords/complexKeywords).
+  // Treat missing arrays as empty — same defensive pattern as scoreKeywords.
+  const list = Array.isArray(patterns) ? patterns : [];
+  const hits = list.filter(p => {
     if (p instanceof RegExp) return p.test(text);
     if (typeof p === "string") return new RegExp(p, "i").test(text);
     return false;
@@ -105,7 +115,8 @@ function classify(text, estimatedTokens, scoreConfig, tiersOrModels, defaultProv
 
   // Compute agenticScore (0-1) from agenticKeywords alone. Used to gate
   // optional agentic tiers (B3). Does NOT modify the score directly.
-  const agenticHits = s.agenticKeywords.filter(kw => lower.includes(kw.toLowerCase())).length;
+  const agenticList = Array.isArray(s.agenticKeywords) ? s.agenticKeywords : [];
+  const agenticHits = agenticList.filter(kw => lower.includes(kw.toLowerCase())).length;
   // Normalize: 4+ matches = 1.0, 3 = 0.6, 1-2 = 0.2, 0 = 0.
   const agenticScore = agenticHits >= 4 ? 1.0
                     : agenticHits === 3 ? 0.6
